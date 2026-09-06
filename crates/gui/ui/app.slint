@@ -1,0 +1,108 @@
+import { Button, LineEdit, ListView } from "std-widgets.slint";
+
+export struct NodeRowData {
+    id: int,
+    name: string,
+    country: string,
+    protocol: string,
+    latency_text: string,
+    latency_color: color,
+    is_active: bool,
+}
+
+export component MainWindow inherits Window {
+    title: "Yarisugi Proxy";
+    width: 1000px;
+    height: 720px;
+    background: #121214;
+
+    in property <[NodeRowData]> nodes_model;
+    in property <int> total_nodes_count: 0;
+    in property <string> active_node_name: "No node selected";
+    in property <string> status_text: "Network backend unavailable";
+
+    callback search_changed(string);
+    callback sort_changed(string);
+    callback node_selected(int);
+    callback probe_all_clicked();
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        HorizontalLayout {
+            height: 42px;
+            spacing: 12px;
+            Rectangle {
+                width: 310px;
+                background: #261618;
+                border-color: #e5484d;
+                border-width: 1px;
+                border-radius: 6px;
+                Text {
+                    text: root.status_text;
+                    color: #e5484d;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    font-size: 12px;
+                }
+            }
+            Text {
+                text: root.active_node_name;
+                color: #d4d4d8;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            Button {
+                text: "Simulate probe burst";
+                clicked => { root.probe_all_clicked(); }
+            }
+        }
+
+        HorizontalLayout {
+            height: 36px;
+            spacing: 10px;
+            LineEdit {
+                placeholder-text: "Search node name...";
+                horizontal-stretch: 1;
+                edited(query) => { root.search_changed(query); }
+            }
+            Button { text: "Latency"; clicked => { root.sort_changed("latency"); } }
+            Button { text: "Country"; clicked => { root.sort_changed("country"); } }
+            Button { text: "A-Z"; clicked => { root.sort_changed("name"); } }
+            Button { text: "Health"; clicked => { root.sort_changed("health"); } }
+        }
+
+        Text {
+            text: "\{root.total_nodes_count} nodes · virtualized viewport · 30 Hz metric batches";
+            color: #a1a1aa;
+            font-size: 11px;
+        }
+
+        Rectangle {
+            background: #18181b;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: #27272a;
+            vertical-stretch: 1;
+            ListView {
+                for node in root.nodes_model: Rectangle {
+                    height: 38px;
+                    background: node.is_active ? #27272a : (touch.has-hover ? #1f1f23 : #18181b);
+                    touch := TouchArea { clicked => { root.node_selected(node.id); } }
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        spacing: 12px;
+                        Text { text: node.country; width: 32px; color: #a1a1aa; font-size: 10px; vertical-alignment: center; }
+                        Text { text: node.name; color: node.is_active ? #ffffff : #d4d4d8; horizontal-stretch: 1; overflow: elide; vertical-alignment: center; }
+                        Text { text: node.protocol; width: 64px; color: #71717a; font-size: 11px; vertical-alignment: center; }
+                        Text { text: node.latency_text; width: 70px; color: node.latency_color; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                    }
+                }
+            }
+        }
+    }
+}

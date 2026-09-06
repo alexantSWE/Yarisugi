@@ -3,12 +3,14 @@ mod query_engine;
 mod repository;
 mod snapshot;
 mod soa_store;
+mod subscription_service;
 
 pub use db::{open_database, open_memory_database};
 pub use query_engine::{query, SortCriteria};
 pub use repository::{NodeRepository, SubscriptionRecord, SyncResult};
-pub use snapshot::StoreSnapshot;
-pub use soa_store::{DenseNodeStore, UNTESTED_LATENCY};
+pub use snapshot::{MetricUpdate, StoreSnapshot};
+pub use soa_store::{DenseNodeStore, HotNodeRow, ProtocolKind, UNTESTED_LATENCY};
+pub use subscription_service::{SubscriptionRefresh, SubscriptionService};
 
 #[cfg(test)]
 mod tests {
@@ -154,5 +156,78 @@ mod tests {
         NodeRepository::sync_subscription(&connection, subscription(1), &report, false).unwrap();
         snapshot.replace_from_db(&connection).unwrap();
         assert_eq!(snapshot.load().len(), 1);
+    }
+
+    #[test]
+    fn metric_batch_publishes_a_new_snapshot() {
+        let store = DenseNodeStore::from_hot_rows([HotNodeRow {
+            id: 7,
+            country_code: *b"DE",
+            latency_ms: UNTESTED_LATENCY,
+            health_score: 0,
+            name: "Metric node".into(),
+            protocol: ProtocolKind::Vless,
+            source_sub_ids: vec![1],
+        }]);
+        let snapshot = StoreSnapshot::new(store);
+        let previous = snapshot.load_full();
+        let next = snapshot.update_metrics_batch(&[MetricUpdate {
+            node_id: 7,
+            latency_ms: 42,
+            health_score: 95,
+        }]);
+        assert_eq!(previous.latencies_ms, vec![UNTESTED_LATENCY]);
+        assert_eq!(next.latencies_ms, vec![42]);
+        assert_eq!(next.health_scores, vec![95]);
+        assert_eq!(next.protocol_kinds, vec![ProtocolKind::Vless]);
+    }
+
+    #[test]
+    fn subscription_service_parses_persists_and_publishes_one_snapshot() {
+        let connection = open_memory_database().unwrap();
+        let snapshot = StoreSnapshot::new(DenseNodeStore::default());
+        let refresh = SubscriptionService::refresh_and_publish(
+            &connection,
+            &snapshot,
+            subscription(1),
+            b"vless://00000000-0000-0000-0000-000000000000@example.com:443#DE",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(refresh.report.successful_nodes.len(), 1);
+        assert_eq!(refresh.sync.inserted_nodes, 1);
+        let store = snapshot.load_full();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.protocol_kinds, vec![ProtocolKind::Vless]);
+        assert_eq!(store.names[0].as_ref(), "DE");
+    }
+
+    #[test]
+    fn subscription_service_protects_existing_snapshot_from_invalid_refresh() {
+        let connection = open_memory_database().unwrap();
+        let snapshot = StoreSnapshot::new(DenseNodeStore::default());
+        SubscriptionService::refresh_and_publish(
+            &connection,
+            &snapshot,
+            subscription(1),
+            b"vless://00000000-0000-0000-0000-000000000000@example.com:443#DE",
+            false,
+        )
+        .unwrap();
+
+        let result = SubscriptionService::refresh_and_publish(
+            &connection,
+            &snapshot,
+            subscription(1),
+            b"this is not a proxy subscription",
+            false,
+        );
+        assert!(result.is_err());
+        assert_eq!(snapshot.load_full().len(), 1);
+        assert_eq!(
+            DenseNodeStore::hydrate_from_db(&connection).unwrap().len(),
+            1
+        );
     }
 }

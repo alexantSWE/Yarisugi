@@ -1,5 +1,4 @@
 use anyhow::{bail, Result};
-use bincode;
 use myproxy_ir::{CanonicalHash, CanonicalNode, SubId};
 use myproxy_parser::IngestionReport;
 use rusqlite::{params, Connection, Transaction};

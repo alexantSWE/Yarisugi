@@ -1,0 +1,15 @@
+[package]
+name = "myproxy-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+anyhow = "1"
+crossbeam-queue = "0.3"
+myproxy-storage = { path = "../storage" }
+slint = "1.17.1"
+
+[build-dependencies]
+slint-build = "1.17.1"
