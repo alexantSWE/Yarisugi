@@ -1,0 +1,17 @@
+[package]
+name = "myproxy-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+base64 = "0.23"
+myproxy-ir = { path = "../ir" }
+percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simd-json = "0.18"
+thiserror = "2"
+url = "2"
+uuid = "1"

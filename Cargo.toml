@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ir",
+    "crates/netd-proto",
+    "crates/netd",
+    "crates/parser",
+        "crates/storage",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
