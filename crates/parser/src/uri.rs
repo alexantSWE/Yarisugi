@@ -143,6 +143,15 @@ fn parse_shadowsocks(url: Url, sub_id: SubId, timestamp: u64) -> Result<Canonica
     let method = parse_ss_method(method)?;
     let endpoint = endpoint(&url, 0)?;
     let query = Query::new(&url);
+    let plugin = query.get("plugin");
+    let (plugin_name, plugin_opts) = match plugin {
+        Some(value) => match value.split_once(';') {
+            Some((name, opts)) if !opts.is_empty() => (Some(name.to_owned()), Some(opts.to_owned())),
+            Some((name, _)) => (Some(name.to_owned()), None),
+            None => (Some(value), query.get("plugin-opts")),
+        },
+        None => (None, None),
+    };
     let label = label(&url, "Shadowsocks Node");
     let meta = make_metadata(sub_id, &label, timestamp)?;
     CanonicalNode::try_new(
@@ -151,8 +160,8 @@ fn parse_shadowsocks(url: Url, sub_id: SubId, timestamp: u64) -> Result<Canonica
         ProtocolSpec::Shadowsocks(ShadowsocksConfig {
             method,
             password: password.into(),
-            plugin: query.get("plugin").map(Into::into),
-            plugin_opts: None,
+            plugin: plugin_name.map(Into::into),
+            plugin_opts: plugin_opts.map(Into::into),
         }),
         TransportSpec::Tcp,
         SecuritySpec::None,

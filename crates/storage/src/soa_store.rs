@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
-use myproxy_ir::{CanonicalNode, ProtocolSpec};
+use anyhow::Result;
+use myproxy_ir::ProtocolSpec;
 use rusqlite::Connection;
 use std::collections::HashMap;
 
@@ -27,6 +27,31 @@ impl ProtocolKind {
             Self::Hysteria2 => "HY2",
             Self::Tuic => "TUIC",
             Self::WireGuard => "WireGuard",
+        }
+    }
+
+    pub fn discriminant(self) -> u8 {
+        match self {
+            Self::Vless => 0,
+            Self::Vmess => 1,
+            Self::Trojan => 2,
+            Self::Shadowsocks => 3,
+            Self::Hysteria2 => 4,
+            Self::Tuic => 5,
+            Self::WireGuard => 6,
+        }
+    }
+
+    pub fn from_discriminant(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Vless),
+            1 => Some(Self::Vmess),
+            2 => Some(Self::Trojan),
+            3 => Some(Self::Shadowsocks),
+            4 => Some(Self::Hysteria2),
+            5 => Some(Self::Tuic),
+            6 => Some(Self::WireGuard),
+            _ => None,
         }
     }
 }
@@ -89,7 +114,7 @@ impl DenseNodeStore {
     pub fn hydrate_from_db(connection: &Connection) -> Result<Self> {
         let mut store = Self::with_capacity(50_000);
         let mut statement = connection.prepare(
-            r#"SELECT n.id, n.country_code, n.name, n.raw_payload,
+            r#"SELECT n.id, n.country_code, n.name, n.protocol_kind,
                       COALESCE(d.latency_ms, 65535), COALESCE(d.health_score, 0)
                FROM nodes n
                LEFT JOIN node_diagnostics d ON d.node_id = n.id
@@ -100,9 +125,8 @@ impl DenseNodeStore {
             let id: u32 = row.get(0)?;
             let country = country_code(row.get::<_, String>(1)?.as_bytes());
             let name: String = row.get(2)?;
-            let payload: Vec<u8> = row.get(3)?;
-            let node: CanonicalNode = bincode::deserialize(&payload)
-                .context("stored canonical node payload could not be decoded")?;
+            let protocol = ProtocolKind::from_discriminant(row.get::<_, u8>(3)?)
+                .unwrap_or(ProtocolKind::Vless);
             let latency: u16 = row.get(4)?;
             let health: u8 = row.get(5)?;
             let index = store.node_ids.len();
@@ -110,9 +134,7 @@ impl DenseNodeStore {
             store.country_codes.push(country);
             store.latencies_ms.push(latency);
             store.health_scores.push(health);
-            store
-                .protocol_kinds
-                .push(ProtocolKind::from(&node.protocol));
+            store.protocol_kinds.push(protocol);
             store.name_lower.push(name.to_lowercase().into_boxed_str());
             store.names.push(name.into_boxed_str());
             store.id_to_index.insert(id, index);
@@ -174,6 +196,10 @@ impl DenseNodeStore {
         }
     }
 
+    pub fn index_of(&self, node_id: u32) -> Option<usize> {
+        self.id_to_index.get(&node_id).copied()
+    }
+
     pub fn has_source(&self, index: usize, sub_id: u16) -> bool {
         let start = self.source_offsets[index] as usize;
         let end = self.source_offsets[index + 1] as usize;
@@ -186,5 +212,50 @@ fn country_code(bytes: &[u8]) -> [u8; 2] {
         [bytes[0], bytes[1]]
     } else {
         *b"UN"
+    }
+}
+
+/// The hot metric layer, aligned by dense index with its `DenseNodeStore`.
+///
+/// It mirrors the read-mostly baseline metrics kept in the store and is the
+/// only column set that publish updates copy-on-write, so a metric batch never
+/// clones the full node store (names, lowercased keys, source map).
+#[derive(Clone, Debug, Default)]
+pub struct MetricsArena {
+    pub latencies_ms: Vec<u16>,
+    pub health_scores: Vec<u8>,
+    pub jitter_ms: Vec<u16>,
+    pub packet_loss: Vec<u8>,
+    pub last_tested: Vec<u64>,
+    pub is_operational: Vec<bool>,
+}
+
+impl MetricsArena {
+    pub fn from_store(store: &DenseNodeStore) -> Self {
+        let capacity = store.len();
+        Self {
+            latencies_ms: store.latencies_ms.clone(),
+            health_scores: store.health_scores.clone(),
+            jitter_ms: vec![0; capacity],
+            packet_loss: vec![0; capacity],
+            last_tested: vec![0; capacity],
+            is_operational: vec![false; capacity],
+        }
+    }
+
+    pub fn apply_update(&mut self, index: usize, latency_ms: u16, health_score: u8) {
+        if index >= self.len() {
+            return;
+        }
+        self.latencies_ms[index] = latency_ms;
+        self.health_scores[index] = health_score.min(100);
+    }
+
+    pub fn len(&self) -> usize {
+        self.latencies_ms.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.latencies_ms.is_empty()
     }
 }

@@ -41,12 +41,7 @@ fn main() -> Result<()> {
     app.on_node_selected(move |node_id| {
         selected_model.select_node(node_id as u32);
         if let Some(app) = selected_app.upgrade() {
-            app.set_active_node_name(
-                selected_model
-                    .selected_name()
-                    .unwrap_or_else(|| "No node selected".into())
-                    .into(),
-            );
+            app.set_active_node_name(selected_model.selected_name().into());
         }
     });
 

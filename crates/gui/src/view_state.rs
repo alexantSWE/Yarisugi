@@ -1,4 +1,4 @@
-use myproxy_storage::{query, DenseNodeStore, SortCriteria};
+use myproxy_storage::{query_with_metrics, DenseNodeStore, MetricsArena, SortCriteria};
 
 #[derive(Debug, Clone)]
 pub struct ViewState {
@@ -20,9 +20,10 @@ impl Default for ViewState {
 }
 
 impl ViewState {
-    pub fn projection(&self, store: &DenseNodeStore) -> Vec<u32> {
-        query(
+    pub fn projection(&self, store: &DenseNodeStore, metrics: &MetricsArena) -> Vec<u32> {
+        query_with_metrics(
             store,
+            metrics,
             &self.search_text,
             self.country_filter,
             self.subscription_filter,
@@ -37,5 +38,12 @@ impl ViewState {
             "health" => SortCriteria::HealthScoreDesc,
             _ => SortCriteria::LatencyAsc,
         };
+    }
+
+    pub fn sort_is_metric_dependent(&self) -> bool {
+        matches!(
+            self.sort,
+            SortCriteria::LatencyAsc | SortCriteria::LatencyDesc | SortCriteria::HealthScoreDesc
+        )
     }
 }

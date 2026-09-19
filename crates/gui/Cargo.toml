@@ -7,6 +7,7 @@ build = "build.rs"
 
 [dependencies]
 anyhow = "1"
+arc-swap = "1"
 crossbeam-queue = "0.3"
 myproxy-storage = { path = "../storage" }
 slint = "1.17.1"

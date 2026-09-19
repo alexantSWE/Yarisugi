@@ -212,6 +212,9 @@ async fn process_request(
         } => {
             require_controller(request_session, session_id)?;
             let mut state = app.state.lock().await;
+            if !heartbeat_allowed(state.active_session, state.routing_active, session_id) {
+                bail!("session does not own the active controller");
+            }
             state.last_heartbeat = Instant::now();
             Ok(NetdResponse::HeartbeatAck { sequence })
         }
@@ -258,6 +261,13 @@ fn require_controller(request_session: u64, connection_session: u64) -> Result<(
         bail!("session does not own the controller");
     }
     Ok(())
+}
+
+/// A heartbeat may only refresh the watchdog when the sending session is the
+/// session that currently owns the active controller; otherwise any authorized
+/// connection could keep routing alive indefinitely.
+fn heartbeat_allowed(active_session: Option<u64>, routing_active: bool, session_id: u64) -> bool {
+    routing_active && active_session == Some(session_id)
 }
 
 fn validate_config(
@@ -362,7 +372,7 @@ fn nix_is_root() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_config;
+    use super::{heartbeat_allowed, validate_config};
 
     #[test]
     fn rejects_default_bypass() {
@@ -374,5 +384,13 @@ mod tests {
     fn accepts_bounded_config() {
         let result = validate_config(12345, 0x1, 100, None, vec!["192.168.0.0/16".into()]);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn heartbeat_allowed_only_for_active_controller() {
+        assert!(heartbeat_allowed(Some(7), true, 7));
+        assert!(!heartbeat_allowed(Some(7), false, 7));
+        assert!(!heartbeat_allowed(None, true, 7));
+        assert!(!heartbeat_allowed(Some(8), true, 7));
     }
 }

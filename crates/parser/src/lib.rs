@@ -32,37 +32,52 @@ pub fn ingest_with_timestamp(raw: &[u8], sub_id: SubId, import_timestamp: u64) -
             return report;
         }
     };
-    let mut entries: Vec<(usize, String)> = text
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            let line = line.trim();
-            (!line.is_empty() && !line.starts_with('#')).then_some((index + 1, line.to_owned()))
-        })
-        .collect();
+    let mut entries = collect_entries(text);
 
-    if entries.len() == 1 && format::scheme_of(&entries[0].1).is_none() {
-        match format::decode_bundle(entries[0].1.as_bytes()) {
-            Ok(decoded) if format::looks_like_supported_entry(&decoded) => {
-                if let Ok(decoded_text) = String::from_utf8(decoded) {
-                    entries = decoded_text
-                        .lines()
-                        .enumerate()
-                        .filter_map(|(index, line)| {
-                            let line = line.trim();
-                            (!line.is_empty() && !line.starts_with('#'))
-                                .then_some((index + 1, line.to_owned()))
-                        })
-                        .collect();
-                }
-            }
-            Ok(_) => record_failure(
+    if !entries.is_empty() && !entries.iter().any(|(_, entry)| format::is_supported_scheme(entry)) {
+        if let Some(reason) = format::detect_container(text) {
+            record_failure(
                 &mut report,
                 0,
                 1,
                 raw,
-                ParseError::UnsupportedFormat("input is not a supported URI bundle".into()),
-            ),
+                ParseError::UnsupportedFormat(reason.into()),
+            );
+            return report;
+        }
+        let joined: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        match format::decode_bundle(joined.as_bytes()) {
+            Ok(decoded) => match String::from_utf8(decoded) {
+                Ok(decoded_text) if format::looks_like_supported_entry(decoded_text.as_bytes()) => {
+                    entries = collect_entries(&decoded_text);
+                }
+                Ok(decoded_text) => {
+                    if let Some(reason) = format::detect_container(&decoded_text) {
+                        record_failure(
+                            &mut report,
+                            0,
+                            1,
+                            raw,
+                            ParseError::UnsupportedFormat(reason.into()),
+                        );
+                        return report;
+                    }
+                    record_failure(
+                        &mut report,
+                        0,
+                        1,
+                        raw,
+                        ParseError::UnsupportedFormat("input is not a supported URI bundle".into()),
+                    );
+                }
+                Err(_) => record_failure(
+                    &mut report,
+                    0,
+                    1,
+                    raw,
+                    ParseError::UnsupportedFormat("input is not a supported URI bundle".into()),
+                ),
+            },
             Err(error) => record_failure(&mut report, 0, 1, raw, ParseError::Base64Decode(error)),
         }
     }
@@ -114,6 +129,16 @@ fn safe_snippet(raw: &[u8]) -> String {
     snippet.chars().take(MAX_SNIPPET_BYTES).collect()
 }
 
+fn collect_entries(text: &str) -> Vec<(usize, String)> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line = line.trim();
+            (!line.is_empty() && !line.starts_with('#')).then_some((index + 1, line.to_owned()))
+        })
+        .collect()
+}
+
 fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -141,6 +166,7 @@ pub(crate) fn make_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     #[test]
     fn malformed_entry_does_not_abort_valid_entries() {
@@ -148,5 +174,49 @@ mod tests {
         let report = ingest_with_timestamp(input, 1, 10);
         assert_eq!(report.successful_nodes.len(), 1);
         assert_eq!(report.failed_entries.len(), 1);
+    }
+
+    #[test]
+    fn multi_line_base64_payload_is_decoded_as_one_bundle() {
+        let payload =
+            "vless://00000000-0000-0000-0000-000000000000@example.com:443#DE\nvless://11111111-1111-1111-1111-111111111111@example.org:443#US";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+        let wrapped = encoded
+            .as_bytes()
+            .chunks(48)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let report = ingest_with_timestamp(wrapped.as_bytes(), 1, 10);
+        assert_eq!(report.successful_nodes.len(), 2);
+    }
+
+    #[test]
+    fn clash_yaml_emits_a_single_failure() {
+        let input = b"proxies:\n  - name: edge\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n";
+        let report = ingest_with_timestamp(input, 1, 10);
+        assert_eq!(report.successful_nodes.len(), 0);
+        assert_eq!(report.failed_entries.len(), 1);
+        assert!(matches!(
+            report.failed_entries[0].reason,
+            ParseError::UnsupportedFormat(_)
+        ));
+    }
+
+    #[test]
+    fn shadowsocks_plugin_opts_are_preserved() {
+        let link = "ss://YWVzLTEyOC1nY206cGFzcw@example.com:8388?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dsecret.example#SSE";
+        let report = ingest_with_timestamp(link.as_bytes(), 1, 10);
+        assert_eq!(report.successful_nodes.len(), 1);
+        match &report.successful_nodes[0].protocol {
+            myproxy_ir::ProtocolSpec::Shadowsocks(config) => {
+                assert_eq!(config.plugin.as_deref(), Some("obfs-local"));
+                assert_eq!(
+                    config.plugin_opts.as_deref(),
+                    Some("obfs=http;obfs-host=secret.example")
+                );
+            }
+            _ => panic!("expected shadowsocks node"),
+        }
     }
 }

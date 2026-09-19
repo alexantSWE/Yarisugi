@@ -6,10 +6,10 @@ mod soa_store;
 mod subscription_service;
 
 pub use db::{open_database, open_memory_database};
-pub use query_engine::{query, SortCriteria};
+pub use query_engine::{query, query_with_metrics, SortCriteria};
 pub use repository::{NodeRepository, SubscriptionRecord, SyncResult};
 pub use snapshot::{MetricUpdate, StoreSnapshot};
-pub use soa_store::{DenseNodeStore, HotNodeRow, ProtocolKind, UNTESTED_LATENCY};
+pub use soa_store::{DenseNodeStore, HotNodeRow, MetricsArena, ProtocolKind, UNTESTED_LATENCY};
 pub use subscription_service::{SubscriptionRefresh, SubscriptionService};
 
 #[cfg(test)]
@@ -180,6 +180,44 @@ mod tests {
         assert_eq!(next.latencies_ms, vec![42]);
         assert_eq!(next.health_scores, vec![95]);
         assert_eq!(next.protocol_kinds, vec![ProtocolKind::Vless]);
+    }
+
+    #[test]
+    fn publish_metrics_updates_only_the_hot_arena() {
+        let store = DenseNodeStore::from_hot_rows([
+            HotNodeRow {
+                id: 7,
+                country_code: *b"DE",
+                latency_ms: UNTESTED_LATENCY,
+                health_score: 0,
+                name: "Cold node".into(),
+                protocol: ProtocolKind::Vless,
+                source_sub_ids: vec![1],
+            },
+            HotNodeRow {
+                id: 8,
+                country_code: *b"US",
+                latency_ms: 100,
+                health_score: 10,
+                name: "Probed node".into(),
+                protocol: ProtocolKind::Trojan,
+                source_sub_ids: vec![1],
+            },
+        ]);
+        let snapshot = StoreSnapshot::new(store);
+        let metrics = snapshot.publish_metrics(&[
+            MetricUpdate {
+                node_id: 8,
+                latency_ms: 33,
+                health_score: 88,
+            },
+            MetricUpdate { node_id: 99, latency_ms: 1, health_score: 1 },
+        ]);
+        assert_eq!(metrics.latencies_ms, vec![UNTESTED_LATENCY, 33]);
+        assert_eq!(metrics.health_scores, vec![0, 88]);
+        let store = snapshot.load_full();
+        assert_eq!(store.latencies_ms, vec![UNTESTED_LATENCY, 100]);
+        assert_eq!(store.health_scores, vec![0, 10]);
     }
 
     #[test]

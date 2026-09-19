@@ -4,6 +4,8 @@ use myproxy_parser::IngestionReport;
 use rusqlite::{params, Connection, Transaction};
 use std::collections::HashSet;
 
+use crate::ProtocolKind;
+
 pub struct SubscriptionRecord<'a> {
     pub id: SubId,
     pub uuid: &'a str,
@@ -99,8 +101,8 @@ impl NodeRepository {
     ) -> Result<usize> {
         let mut inserted = 0;
         let mut insert_node = tx.prepare_cached(
-            r#"INSERT INTO nodes (hash, name, country_code, raw_payload)
-               VALUES (?1, ?2, ?3, ?4)
+            r#"INSERT INTO nodes (hash, name, country_code, protocol_kind, raw_payload)
+               VALUES (?1, ?2, ?3, ?4, ?5)
                ON CONFLICT(hash) DO NOTHING"#,
         )?;
         let mut find_node = tx.prepare_cached("SELECT id FROM nodes WHERE hash = ?1")?;
@@ -117,6 +119,7 @@ impl NodeRepository {
                 &node.hash[..],
                 node.meta.label.as_ref(),
                 country,
+                ProtocolKind::from(&node.protocol).discriminant(),
                 payload
             ])? == 1;
             let node_id: i64 = find_node.query_row(params![&node.hash[..]], |row| row.get(0))?;
@@ -181,8 +184,8 @@ fn ensure_nodes(tx: &Transaction<'_>, nodes: &[CanonicalNode]) -> Result<(usize,
     let mut inserted = 0;
     let mut ids = Vec::with_capacity(nodes.len());
     let mut insert_node = tx.prepare_cached(
-        r#"INSERT INTO nodes (hash, name, country_code, raw_payload)
-           VALUES (?1, ?2, ?3, ?4)
+        r#"INSERT INTO nodes (hash, name, country_code, protocol_kind, raw_payload)
+           VALUES (?1, ?2, ?3, ?4, ?5)
            ON CONFLICT(hash) DO NOTHING"#,
     )?;
     let mut find_node = tx.prepare_cached("SELECT id FROM nodes WHERE hash = ?1")?;
@@ -200,6 +203,7 @@ fn ensure_nodes(tx: &Transaction<'_>, nodes: &[CanonicalNode]) -> Result<(usize,
             &node.hash[..],
             node.meta.label.as_ref(),
             country,
+            ProtocolKind::from(&node.protocol).discriminant(),
             payload
         ])? == 1
         {

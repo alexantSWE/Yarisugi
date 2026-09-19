@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags};
+use myproxy_ir::CanonicalNode;
+use rusqlite::{params, Connection, OpenFlags};
 use std::path::Path;
+
+use crate::ProtocolKind;
 
 pub fn open_database<P: AsRef<Path>>(path: P) -> Result<Connection> {
     let connection = Connection::open_with_flags(
@@ -50,6 +53,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             hash BLOB NOT NULL UNIQUE CHECK(length(hash) = 32),
             name TEXT NOT NULL,
             country_code TEXT NOT NULL CHECK(length(country_code) = 2),
+            protocol_kind INTEGER NOT NULL DEFAULT 0,
             raw_payload BLOB NOT NULL
         );
 
@@ -73,5 +77,105 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_diag_latency ON node_diagnostics(latency_ms);
         "#,
     )?;
+    ensure_protocol_kind_column(connection)?;
     Ok(())
+}
+
+/// Adds the `protocol_kind` column to databases created before the column
+/// existed, then backfills it from each stored payload in a single pass.
+fn ensure_protocol_kind_column(connection: &Connection) -> Result<()> {
+    let has_column = {
+        let mut statement = connection.prepare("PRAGMA table_info(nodes)")?;
+        let mut rows = statement.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            if row.get::<_, String>(1)? == "protocol_kind" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if has_column {
+        return Ok(());
+    }
+    connection.execute_batch(
+        "ALTER TABLE nodes ADD COLUMN protocol_kind INTEGER NOT NULL DEFAULT 0",
+    )?;
+    let mut select = connection.prepare("SELECT id, raw_payload FROM nodes")?;
+    let mut update = connection.prepare("UPDATE nodes SET protocol_kind = ?2 WHERE id = ?1")?;
+    let mut rows = select.query([])?;
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let payload: Vec<u8> = row.get(1)?;
+        let node: CanonicalNode = match bincode::deserialize(&payload) {
+            Ok(node) => node,
+            Err(_) => continue,
+        };
+        update.execute(params![id, ProtocolKind::from(&node.protocol).discriminant()])?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use myproxy_ir::{
+        CanonicalNode, EndpointTarget, NodeMetadata, ProtocolSpec, SecuritySpec, TransportSpec,
+        VlessConfig,
+    };
+    use uuid::Uuid;
+
+    fn vless_node() -> CanonicalNode {
+        CanonicalNode::try_new(
+            NodeMetadata::new(1, "Legacy node", *b"DE", 1).unwrap(),
+            EndpointTarget::domain("example.com", 443).unwrap(),
+            ProtocolSpec::Vless(VlessConfig {
+                uuid: Uuid::nil(),
+                flow: None,
+            }),
+            TransportSpec::Tcp,
+            SecuritySpec::None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_database_gains_and_backfills_protocol_kind() {
+        let connection = open_memory_database().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                DROP TABLE node_diagnostics;
+                DROP TABLE node_sources;
+                DROP TABLE nodes;
+                CREATE TABLE nodes (
+                    id INTEGER PRIMARY KEY,
+                    hash BLOB NOT NULL UNIQUE CHECK(length(hash) = 32),
+                    name TEXT NOT NULL,
+                    country_code TEXT NOT NULL CHECK(length(country_code) = 2),
+                    raw_payload BLOB NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+        let node = vless_node();
+        let payload = bincode::serialize(&node).unwrap();
+        connection
+            .execute(
+                "INSERT INTO nodes (hash, name, country_code, raw_payload) VALUES (?1, ?2, ?3, ?4)",
+                params![&node.hash[..], node.meta.label.as_ref(), "DE", payload],
+            )
+            .unwrap();
+
+        initialize_schema(&connection).unwrap();
+
+        let kind: u8 = connection
+            .query_row("SELECT protocol_kind FROM nodes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kind, ProtocolKind::from(&node.protocol).discriminant());
+        let store = crate::DenseNodeStore::hydrate_from_db(&connection).unwrap();
+        assert_eq!(store.protocol_kinds, vec![ProtocolKind::from(&node.protocol)]);
+    }
 }

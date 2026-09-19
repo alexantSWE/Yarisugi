@@ -1,5 +1,6 @@
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
+use serde::Deserialize;
 
 const MAX_DECODED_BYTES: usize = 8 * 1024 * 1024;
 
@@ -35,24 +36,56 @@ pub fn scheme_of(entry: &str) -> Option<&str> {
 }
 
 pub fn looks_like_supported_entry(bytes: &[u8]) -> bool {
-    let text = match std::str::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(_) => return false,
-    };
+    std::str::from_utf8(bytes).is_ok_and(|text| text.lines().any(|line| is_supported_scheme(line.trim())))
+}
+
+pub fn is_supported_scheme(entry: &str) -> bool {
+    matches!(
+        scheme_of(entry).map(str::to_ascii_lowercase).as_deref(),
+        Some("vless")
+            | Some("vmess")
+            | Some("trojan")
+            | Some("ss")
+            | Some("hysteria2")
+            | Some("hy2")
+            | Some("tuic")
+    )
+}
+
+/// Recognizes well-known subscription container formats so callers can emit a
+/// single precise failure instead of a wall of per-line "unsupported scheme"
+/// errors.
+pub fn detect_container(text: &str) -> Option<&'static str> {
+    if looks_like_clash_yaml(text) {
+        return Some("Clash YAML configuration is not supported; use proxy URI entries");
+    }
+    if looks_like_singbox_json(text) {
+        return Some("Sing-box JSON configuration is not supported; use proxy URI entries");
+    }
+    None
+}
+
+fn looks_like_clash_yaml(text: &str) -> bool {
     text.lines().any(|line| {
-        matches!(
-            scheme_of(line.trim())
-                .map(str::to_ascii_lowercase)
-                .as_deref(),
-            Some("vless")
-                | Some("vmess")
-                | Some("trojan")
-                | Some("ss")
-                | Some("hysteria2")
-                | Some("hy2")
-                | Some("tuic")
-        )
+        let line = line.trim();
+        line == "proxies:" || line == "proxy-groups:" || line == "rules:"
     })
+}
+
+fn looks_like_singbox_json(text: &str) -> bool {
+    if !text.trim_start().starts_with('{') {
+        return false;
+    }
+    #[derive(Deserialize)]
+    struct ContainerProbe {
+        outbounds: Option<serde_json::Value>,
+        inbounds: Option<serde_json::Value>,
+    }
+    let mut bytes = text.as_bytes().to_vec();
+    match simd_json::serde::from_slice::<ContainerProbe>(&mut bytes) {
+        Ok(probe) => probe.outbounds.is_some() || probe.inbounds.is_some(),
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -72,5 +105,22 @@ mod tests {
     fn rejects_random_decodable_text_at_dispatch_boundary() {
         let decoded = decode_bundle(b"Zm9v").unwrap();
         assert!(!looks_like_supported_entry(&decoded));
+    }
+
+    #[test]
+    fn detects_clash_yaml_containers() {
+        let yaml = "proxies:\n  - name: edge-01\n    type: ss\n    server: 1.2.3.4\n";
+        assert!(detect_container(yaml).is_some());
+    }
+
+    #[test]
+    fn detects_singbox_json_containers() {
+        let json = r#"{"log":{},"outbounds":[{"type":"direct"}]}"#;
+        assert!(detect_container(json).is_some());
+    }
+
+    #[test]
+    fn leaves_supported_uri_entries_alone() {
+        assert!(detect_container("vless://a@example.com:443#DE").is_none());
     }
 }
