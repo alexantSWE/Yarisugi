@@ -1,10 +1,12 @@
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 use myproxy_netd_proto::{
     NetdRequest, NetdResponse, DEFAULT_SOCKET_PATH, HEARTBEAT_INTERVAL_SECS, MAX_FRAME_BYTES,
     PROTOCOL_VERSION, WATCHDOG_TIMEOUT_SECS,
 };
+use netfilter::{NftablesBackend, RoutingBackend, TProxySettings};
+use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,13 +17,17 @@ use tokio::time::Instant;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{error, info, warn};
 
+mod netfilter;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RoutingConfig {
     tproxy_port: u16,
     proxy_fwmark: u32,
     table_id: u32,
-    dns_ipv4: Option<std::net::Ipv4Addr>,
+    dns_ipv4: Option<Ipv4Addr>,
     bypass_subnets: Vec<Ipv4Net>,
+    bypass_subnets_v6: Vec<Ipv6Net>,
+    core_uid: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -35,20 +41,31 @@ struct DaemonState {
 #[derive(Clone, Default)]
 struct NoopBackend;
 
-impl NoopBackend {
-    async fn enable(&self, _config: &RoutingConfig) -> Result<()> {
+impl RoutingBackend for NoopBackend {
+    fn enable(&self, _settings: &TProxySettings) -> Result<()> {
         Ok(())
     }
 
-    async fn disable(&self, _config: Option<&RoutingConfig>) -> Result<()> {
+    fn disable(&self, _settings: Option<&TProxySettings>) -> Result<()> {
         Ok(())
+    }
+}
+
+/// Selects the routing backend to use. `MYPROXY_NETD_BACKEND=netfilter` forces
+/// the real nftables/TProxy backend and is used when the daemon runs with root
+/// privileges; anything else (including non-root development runs) falls back
+/// to the no-op backend so the control plane stays testable.
+fn choose_backend() -> Arc<dyn RoutingBackend> {
+    match std::env::var("MYPROXY_NETD_BACKEND").as_deref() {
+        Ok("netfilter") if nix_is_root() => Arc::new(NftablesBackend) as Arc<dyn RoutingBackend>,
+        _ => Arc::new(NoopBackend) as Arc<dyn RoutingBackend>,
     }
 }
 
 #[derive(Clone)]
 struct AppState {
     state: Arc<Mutex<DaemonState>>,
-    backend: NoopBackend,
+    backend: Arc<dyn RoutingBackend>,
 }
 
 #[tokio::main]
@@ -75,7 +92,7 @@ async fn main() -> Result<()> {
             last_heartbeat: Instant::now(),
             routing_config: None,
         })),
-        backend: NoopBackend,
+        backend: choose_backend(),
     };
 
     info!(socket = %socket_path.display(), "myproxy-netd control plane ready");
@@ -179,6 +196,8 @@ async fn process_request(
             table_id,
             dns_ipv4,
             bypass_subnets,
+            bypass_subnets_v6,
+            core_uid,
         } => {
             require_controller(request_session, session_id)?;
             let config = validate_config(
@@ -187,9 +206,11 @@ async fn process_request(
                 table_id,
                 dns_ipv4,
                 bypass_subnets,
+                bypass_subnets_v6,
+                core_uid,
             )?;
             claim_controller(app, session_id).await?;
-            if let Err(error) = app.backend.enable(&config).await {
+            if let Err(error) = app.backend.enable(&TProxySettings::from(&config)) {
                 release_session(app, session_id).await;
                 return Err(error);
             }
@@ -223,11 +244,11 @@ async fn process_request(
 }
 
 async fn rollback(app: &AppState) -> Result<()> {
-    let config = {
+    let settings = {
         let state = app.state.lock().await;
-        state.routing_config.clone()
+        state.routing_config.as_ref().map(TProxySettings::from)
     };
-    app.backend.disable(config.as_ref()).await?;
+    app.backend.disable(settings.as_ref())?;
     let mut state = app.state.lock().await;
     state.routing_active = false;
     state.routing_config = None;
@@ -274,8 +295,10 @@ fn validate_config(
     tproxy_port: u16,
     proxy_fwmark: u32,
     table_id: u32,
-    dns_ipv4: Option<std::net::Ipv4Addr>,
+    dns_ipv4: Option<Ipv4Addr>,
     bypass_subnets: Vec<String>,
+    bypass_subnets_v6: Vec<String>,
+    core_uid: Option<u32>,
 ) -> Result<RoutingConfig> {
     if !(1024..=65535).contains(&tproxy_port) {
         bail!("tproxy port must be between 1024 and 65535");
@@ -291,8 +314,18 @@ fn validate_config(
             bail!("DNS address is not routable");
         }
     }
+    {
+        if let Some(uid) = core_uid {
+            if uid == 0 || uid == u32::MAX {
+                bail!("proxy core UID must be a real user id");
+            }
+        }
+    }
     if bypass_subnets.len() > 256 {
         bail!("too many bypass subnets");
+    }
+    if bypass_subnets_v6.len() > 256 {
+        bail!("too many IPv6 bypass subnets");
     }
     let mut parsed = Vec::with_capacity(bypass_subnets.len());
     for subnet in bypass_subnets {
@@ -304,12 +337,24 @@ fn validate_config(
         }
         parsed.push(network);
     }
+    let mut parsed_v6 = Vec::with_capacity(bypass_subnets_v6.len());
+    for subnet in bypass_subnets_v6 {
+        let network: Ipv6Net = subnet
+            .parse()
+            .with_context(|| format!("invalid IPv6 subnet: {subnet}"))?;
+        if network.prefix_len() == 0 {
+            bail!("the default route cannot be a bypass subnet");
+        }
+        parsed_v6.push(network);
+    }
     Ok(RoutingConfig {
         tproxy_port,
         proxy_fwmark,
         table_id,
         dns_ipv4,
         bypass_subnets: parsed,
+        bypass_subnets_v6: parsed_v6,
+        core_uid,
     })
 }
 
@@ -374,16 +419,47 @@ fn nix_is_root() -> bool {
 mod tests {
     use super::{heartbeat_allowed, validate_config};
 
+    fn config(
+        v4: Vec<&str>,
+        v6: Vec<&str>,
+        core_uid: Option<u32>,
+    ) -> super::Result<super::RoutingConfig> {
+        validate_config(
+            12345,
+            0x1,
+            100,
+            None,
+            v4.into_iter().map(String::from).collect(),
+            v6.into_iter().map(String::from).collect(),
+            core_uid,
+        )
+    }
+
     #[test]
     fn rejects_default_bypass() {
-        let result = validate_config(12345, 1, 100, None, vec!["0.0.0.0/0".into()]);
-        assert!(result.is_err());
+        assert!(config(vec!["0.0.0.0/0"], vec![], None).is_err());
+        assert!(config(vec![], vec!["::/0"], None).is_err());
     }
 
     #[test]
     fn accepts_bounded_config() {
-        let result = validate_config(12345, 0x1, 100, None, vec!["192.168.0.0/16".into()]);
+        let result = config(
+            vec!["192.168.0.0/16"],
+            vec!["fc00::/7", "fe80::/10"],
+            Some(1000),
+        );
         assert!(result.is_ok());
+        let parsed = result.unwrap();
+        assert_eq!(parsed.core_uid, Some(1000));
+        assert_eq!(parsed.bypass_subnets_v6.len(), 2);
+    }
+
+    #[test]
+    fn rejects_invalid_subnets_and_uid() {
+        assert!(config(vec!["not-a-subnet"], vec![], None).is_err());
+        assert!(config(vec![], vec!["not-v6"], None).is_err());
+        assert!(config(vec![], vec![], Some(0)).is_err());
+        assert!(config(vec![], vec![], Some(u32::MAX)).is_err());
     }
 
     #[test]

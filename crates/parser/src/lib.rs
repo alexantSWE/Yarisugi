@@ -1,3 +1,4 @@
+mod clash;
 mod error;
 mod format;
 mod metadata;
@@ -35,15 +36,24 @@ pub fn ingest_with_timestamp(raw: &[u8], sub_id: SubId, import_timestamp: u64) -
     let mut entries = collect_entries(text);
 
     if !entries.is_empty() && !entries.iter().any(|(_, entry)| format::is_supported_scheme(entry)) {
-        if let Some(reason) = format::detect_container(text) {
-            record_failure(
-                &mut report,
-                0,
-                1,
-                raw,
-                ParseError::UnsupportedFormat(reason.into()),
-            );
-            return report;
+        match format::detect_container(text) {
+            Some(format::ContainerKind::ClashYaml) => {
+                ingest_clash_document(&mut report, raw, text, sub_id, import_timestamp);
+                return report;
+            }
+            Some(format::ContainerKind::SingBoxJson) => {
+                record_failure(
+                    &mut report,
+                    0,
+                    1,
+                    raw,
+                    ParseError::UnsupportedFormat(
+                        "sing-box JSON configuration is not supported; use proxy URI entries".into(),
+                    ),
+                );
+                return report;
+            }
+            None => {}
         }
         let joined: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         match format::decode_bundle(joined.as_bytes()) {
@@ -52,23 +62,33 @@ pub fn ingest_with_timestamp(raw: &[u8], sub_id: SubId, import_timestamp: u64) -
                     entries = collect_entries(&decoded_text);
                 }
                 Ok(decoded_text) => {
-                    if let Some(reason) = format::detect_container(&decoded_text) {
-                        record_failure(
+                    match format::detect_container(&decoded_text) {
+                        Some(format::ContainerKind::ClashYaml) => {
+                            ingest_clash_document(&mut report, raw, &decoded_text, sub_id, import_timestamp);
+                            return report;
+                        }
+                        Some(format::ContainerKind::SingBoxJson) => {
+                            record_failure(
+                                &mut report,
+                                0,
+                                1,
+                                raw,
+                                ParseError::UnsupportedFormat(
+                                    "sing-box JSON configuration is not supported; use proxy URI entries".into(),
+                                ),
+                            );
+                            return report;
+                        }
+                        None => record_failure(
                             &mut report,
                             0,
                             1,
                             raw,
-                            ParseError::UnsupportedFormat(reason.into()),
-                        );
-                        return report;
+                            ParseError::UnsupportedFormat(
+                                "input is not a supported URI bundle".into(),
+                            ),
+                        ),
                     }
-                    record_failure(
-                        &mut report,
-                        0,
-                        1,
-                        raw,
-                        ParseError::UnsupportedFormat("input is not a supported URI bundle".into()),
-                    );
                 }
                 Err(_) => record_failure(
                     &mut report,
@@ -103,6 +123,31 @@ pub fn ingest_with_timestamp(raw: &[u8], sub_id: SubId, import_timestamp: u64) -
         }
     }
     report
+}
+
+fn ingest_clash_document(
+    report: &mut IngestionReport,
+    raw: &[u8],
+    text: &str,
+    sub_id: SubId,
+    import_timestamp: u64,
+) {
+    let results = match clash::ingest_clash_yaml(text, sub_id, import_timestamp) {
+        Ok(results) => results,
+        Err(reason) => {
+            record_failure(report, 0, 1, raw, reason);
+            return;
+        }
+    };
+    let mut seen = HashSet::<CanonicalHash>::with_capacity(results.len().min(MAX_ENTRIES));
+    for (index, result) in results.into_iter().take(MAX_ENTRIES).enumerate() {
+        report.total_entries_scanned += 1;
+        match result {
+            Ok(node) if seen.insert(node.hash) => report.successful_nodes.push(node),
+            Ok(_) => report.duplicates_omitted += 1,
+            Err(reason) => record_failure(report, index, index + 1, raw, reason),
+        }
+    }
 }
 
 fn record_failure(
@@ -192,15 +237,12 @@ mod tests {
     }
 
     #[test]
-    fn clash_yaml_emits_a_single_failure() {
-        let input = b"proxies:\n  - name: edge\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n";
+    fn clash_yaml_is_ingested() {
+        let input = b"proxies:\n  - name: edge\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n    cipher: aes-128-gcm\n    password: secret\n";
         let report = ingest_with_timestamp(input, 1, 10);
-        assert_eq!(report.successful_nodes.len(), 0);
-        assert_eq!(report.failed_entries.len(), 1);
-        assert!(matches!(
-            report.failed_entries[0].reason,
-            ParseError::UnsupportedFormat(_)
-        ));
+        assert_eq!(report.successful_nodes.len(), 1);
+        assert_eq!(report.failed_entries.len(), 0);
+        assert_eq!(report.successful_nodes[0].meta.country_code, *b"UN");
     }
 
     #[test]

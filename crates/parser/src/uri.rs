@@ -242,7 +242,7 @@ fn parse_tuic(url: Url, sub_id: SubId, timestamp: u64) -> Result<CanonicalNode, 
     .map_err(|error| ParseError::InvalidEndpoint(error.to_string()))
 }
 
-fn parse_ss_method(value: &str) -> Result<ShadowsocksCipher, ParseError> {
+pub(crate) fn parse_ss_method(value: &str) -> Result<ShadowsocksCipher, ParseError> {
     match value.to_ascii_lowercase().as_str() {
         "aes-128-gcm" => Ok(ShadowsocksCipher::Aes128Gcm),
         "aes-256-gcm" => Ok(ShadowsocksCipher::Aes256Gcm),
@@ -392,7 +392,7 @@ fn split_csv(value: Option<String>) -> Vec<Arc<str>> {
         .map(Into::into)
         .collect()
 }
-fn parse_uuid(value: &str) -> Result<Uuid, ParseError> {
+pub(crate) fn parse_uuid(value: &str) -> Result<Uuid, ParseError> {
     Uuid::parse_str(value).map_err(|_| ParseError::InvalidUuid(value.to_owned()))
 }
 fn parse_u16(value: &serde_json::Value, field: &'static str) -> Result<u16, ParseError> {
@@ -410,7 +410,7 @@ fn endpoint(url: &Url, default_port: u16) -> Result<EndpointTarget, ParseError> 
         .ok_or(ParseError::MissingField("port"))?;
     endpoint_from_host(host, port)
 }
-fn endpoint_from_host(host: &str, port: u16) -> Result<EndpointTarget, ParseError> {
+pub(crate) fn endpoint_from_host(host: &str, port: u16) -> Result<EndpointTarget, ParseError> {
     if port == 0 {
         return Err(ParseError::InvalidEndpoint("port cannot be zero".into()));
     }

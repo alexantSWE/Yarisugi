@@ -70,7 +70,7 @@ mod tests {
         let second = node("Second");
         let tx = connection.unchecked_transaction().unwrap();
         assert_eq!(
-            NodeRepository::bulk_insert_nodes(&tx, 1, &[first.clone()]).unwrap(),
+            NodeRepository::bulk_insert_nodes(&tx, 1, std::slice::from_ref(&first)).unwrap(),
             1
         );
         assert_eq!(

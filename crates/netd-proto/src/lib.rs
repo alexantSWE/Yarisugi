@@ -19,6 +19,8 @@ pub enum NetdRequest {
         table_id: u32,
         dns_ipv4: Option<Ipv4Addr>,
         bypass_subnets: Vec<String>,
+        bypass_subnets_v6: Vec<String>,
+        core_uid: Option<u32>,
     },
     DisableRouting {
         session_id: u64,

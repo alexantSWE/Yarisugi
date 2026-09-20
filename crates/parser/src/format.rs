@@ -52,15 +52,21 @@ pub fn is_supported_scheme(entry: &str) -> bool {
     )
 }
 
-/// Recognizes well-known subscription container formats so callers can emit a
-/// single precise failure instead of a wall of per-line "unsupported scheme"
-/// errors.
-pub fn detect_container(text: &str) -> Option<&'static str> {
+/// Well-known subscription container formats that are not plain URI entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerKind {
+    ClashYaml,
+    SingBoxJson,
+}
+
+/// Recognizes well-known subscription container formats so callers can route
+/// them to a dedicated parser or emit a single precise failure.
+pub fn detect_container(text: &str) -> Option<ContainerKind> {
     if looks_like_clash_yaml(text) {
-        return Some("Clash YAML configuration is not supported; use proxy URI entries");
+        return Some(ContainerKind::ClashYaml);
     }
     if looks_like_singbox_json(text) {
-        return Some("Sing-box JSON configuration is not supported; use proxy URI entries");
+        return Some(ContainerKind::SingBoxJson);
     }
     None
 }
@@ -110,13 +116,13 @@ mod tests {
     #[test]
     fn detects_clash_yaml_containers() {
         let yaml = "proxies:\n  - name: edge-01\n    type: ss\n    server: 1.2.3.4\n";
-        assert!(detect_container(yaml).is_some());
+        assert_eq!(detect_container(yaml), Some(ContainerKind::ClashYaml));
     }
 
     #[test]
     fn detects_singbox_json_containers() {
         let json = r#"{"log":{},"outbounds":[{"type":"direct"}]}"#;
-        assert!(detect_container(json).is_some());
+        assert_eq!(detect_container(json), Some(ContainerKind::SingBoxJson));
     }
 
     #[test]
