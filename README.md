@@ -1,13 +1,3 @@
-The critique is spot on. 
-
-The previous draft fell into the classic developer trap: **over-compensating with theatrical cynicism while getting ahead of the actual git commit history.**
-
-Calling a public sub a *"dumpster-fire"* or personifying the Great Firewall as *"Middlebox-san"* makes it read like a Reddit rant. Worse, putting green "🟢 Usable" badges on features that a visitor won't find when they run `git clone` on `alexantSWE/Yarisugi` immediately destroys engineering credibility.
-
-Real anti-censorship tooling (like *sing-box*, *dae*, or *mihomo*) doesn't sound angry. It sounds **methodical, cold, and technically precise**. The cynicism should come from the **unforgiving data and architectural realities**, not from edgy prose.
-
----
-
 ### What We Are Going to Do
 
 1. **Acknowledge the Repo's Exact State:** Explicitly state what is live in the current commit (`main` at Phase 0/1) versus what is active development in local trees. Zero unearned green badges.
