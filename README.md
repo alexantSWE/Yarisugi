@@ -1,19 +1,4 @@
-### What We Are Going to Do
 
-1. **Acknowledge the Repo's Exact State:** Explicitly state what is live in the current commit (`main` at Phase 0/1) versus what is active development in local trees. Zero unearned green badges.
-2. **Translate Your 3 Gripes into Grounded Engineering Principles:**
-   * **Gripe 1 (The `cp.cloudflare` Ping Lie):** Ground it in Anycast PoP deception (measuring edge latency, not tunnel egress), captive portal fake `200 OK`s, and the reality that scraped public lists regularly have a **<5% true survival rate**.
-   * **Gripe 2 (Protocol Semantics vs. DPI):** Explain the **REALITY decoy trap** (unauthorized probes get forwarded to Apple/Microsoft, returning valid certs to naive testers), **TLS-in-TLS packet length signatures** (why `vision` padding matters against modern middlebox heuristics), and **UDP/QUIC line throttling**.
-   * **Gripe 3 (Wasted Core Potential):** Call out why existing Linux frontends waste sing-box: dumbing it down to loopback SOCKS5 (`127.0.0.1:10808`), failing to configure DNS detours, and leaking lookups past `systemd-resolved`.
-3. **Adopt the Dry, Authoritative Voice:** Modeled after the cleanest READMEs in the proxy space—compact, direct, and impossible to dismiss as marketing fluff.
-
----
-
-### The Grounded, Data-Driven README
-
-Here is the replacement `README.md` for `alexantSWE/Yarisugi`:
-
-```markdown
 # Yarisugi (やりすぎ)
 
 A native Linux proxy toolchain manager designed for hostile network environments, massive node catalogs, and zero-compromise system routing.
