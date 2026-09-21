@@ -25,6 +25,10 @@ impl Supervisor {
         &self.config_path
     }
 
+    pub fn binary_path(&self) -> &std::path::Path {
+        &self.binary
+    }
+
     fn check_command(&self) -> Command {
         let mut command = Command::new(&self.binary);
         command
@@ -104,6 +108,35 @@ impl Supervisor {
     pub fn is_running(&self) -> bool {
         self.child.is_some()
     }
+
+    /// Atomically applies a new config: writes it, validates, then hot-reloads
+    /// (or cold-starts) the core. If the swap is rejected, the previous config
+    /// file is restored and the live process is asked to keep running the old
+    /// config, so a bad node swap can never brick the session -- a hard
+    /// requirement with ephemeral public subscriptions.
+    pub fn apply_config(&mut self, config_json: &[u8]) -> Result<()> {
+        let previous = std::fs::read(&self.config_path).ok();
+        std::fs::write(&self.config_path, config_json)?;
+        let applying = (|| -> Result<()> {
+            self.validate_config()?;
+            if self.is_running() {
+                self.reload()?;
+            } else {
+                self.start()?;
+            }
+            Ok(())
+        })();
+        if applying.is_err() {
+            if let Some(previous) = previous {
+                if std::fs::write(&self.config_path, previous).is_ok() && self.is_running() {
+                    // Best-effort rollback: the old file was valid (the process
+                    // was running off it), so a fresh SIGHUP restores it.
+                    let _ = self.reload();
+                }
+            }
+        }
+        applying
+    }
 }
 
 #[cfg(test)]
@@ -127,5 +160,64 @@ mod tests {
         );
         assert!(!supervisor.is_running());
         assert!(supervisor.reload().is_err());
+    }
+
+    fn minimal_config(port: u16) -> Vec<u8> {
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "log": { "level": "warn", "timestamp": true },
+            "inbounds": [{
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": port
+            }],
+            "outbounds": [ { "type": "direct", "tag": "direct" } ],
+            "route": {
+                "auto_detect_interface": false,
+                "default_mark": 0,
+                "rules": [ { "action": "route", "outbound": "direct" } ]
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn apply_config_rolls_back_rejected_swap_and_keeps_session() {
+        let binary = std::env::var_os("SING_BOX_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/usr/bin/sing-box"));
+        if !binary.exists() {
+            eprintln!("skipping: no sing-box binary at {}", binary.display());
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "myproxy-supervisor-revert-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let valid = minimal_config(19991);
+        let mut supervisor = Supervisor::new(&binary, &path);
+        supervisor.apply_config(&valid).unwrap();
+        assert!(supervisor.is_running());
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let rejected = b"{\"inbounds\": \"not an array\"}";
+        assert!(
+            supervisor.apply_config(rejected).is_err(),
+            "a config sing-box rejects must fail the swap"
+        );
+        assert!(supervisor.is_running(), "old process must survive a rejected swap");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            valid,
+            "config file must roll back to the previous valid render"
+        );
+
+        // The rolled-back file is valid and the session is still switchable.
+        supervisor.apply_config(&valid).unwrap();
+        assert!(supervisor.is_running());
+        supervisor.stop().unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -5,9 +5,11 @@ use myproxy_ir::{
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+pub mod egress;
 pub mod supervisor;
 
 /// Compiles canonical nodes into sing-box JSON. The adapter is the shim between
@@ -212,22 +214,92 @@ pub fn compile_tproxy_inbound(listen: &str, port: u16) -> Value {
         "tag": "tproxy-in",
         "listen": listen,
         "listen_port": port,
-        "sniff": true,
-        "sniff_override_destination": true,
     })
 }
 
 /// Routes every connection to the single proxy outbound. Marks outbound
 /// sockets with `mark` so the kernel policy routing (nftables output chain)
-/// keeps the core's own traffic clear of the TPROXY loop.
+/// keeps the core's own traffic clear of the TPROXY loop. Sniffing runs as a
+/// rule action (the legacy inbound `sniff`/`sniff_override_destination` fields
+/// were removed in sing-box 1.13.0) so TLS SNI / sniffed protocols can override
+/// the transparent destination before the route rule applies.
 pub fn compile_routing(outbound_tag: &str, mark: u32, auto_detect_interface: bool) -> Value {
     json!({
         "auto_detect_interface": auto_detect_interface,
         "default_mark": mark,
         "rules": [
+            { "action": "sniff", "override_destination": true },
             { "action": "route", "outbound": outbound_tag }
         ]
     })
+}
+
+/// DoH resolver used by the tunneled DNS section. The resolver is dialed via
+/// `detour` through the node's outbound, so the *client's* local network (which
+/// may firewall well-known DoH providers) is irrelevant: only the node's egress
+/// network has to serve it. Defaults to Cloudflare; switch if a node's ISP has
+/// poor reachability to a given provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DnsProvider {
+    #[default]
+    Cloudflare,
+    Quad9,
+    Google,
+    AdGuard,
+    Custom(&'static str),
+}
+
+impl DnsProvider {
+    /// RFC 8484 DoH host. The sing-box `https` DNS server type dials
+    /// `/dns-query` on this host over TLS.
+    pub fn server(self) -> &'static str {
+        match self {
+            DnsProvider::Cloudflare => "1.1.1.1",
+            DnsProvider::Quad9 => "dns.quad9.net",
+            DnsProvider::Google => "dns.google",
+            DnsProvider::AdGuard => "dns.adguard-dns.com",
+            DnsProvider::Custom(host) => host,
+        }
+    }
+}
+
+/// A LAN DNS resolver used for traffic the tunnel does **not** carry. In a
+/// network that blocks secure DNS from the machine itself (TLS/QUIC/DNSCrypt
+/// all dead on the wire), the only reliable untunnelled resolver is a plain
+/// UDP server on the LAN -- conventionally the default gateway or a Pi-hole
+/// / AdGuard Home box. Defaults to the gateway discovered via `/proc/net/route`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalDns {
+    pub ipv4: Ipv4Addr,
+    pub port: u16,
+}
+
+impl LocalDns {
+    pub fn new(ipv4: Ipv4Addr, port: u16) -> Self {
+        Self { ipv4, port }
+    }
+}
+
+/// Reads the IPv4 default gateway from `/proc/net/route` (the first line whose
+/// destination is `00000000`, addresses in little-endian hex).
+pub fn default_gateway_v4() -> Option<Ipv4Addr> {
+    let contents = std::fs::read_to_string("/proc/net/route").ok()?;
+    parse_route_table(&contents)
+}
+
+fn parse_route_table(contents: &str) -> Option<Ipv4Addr> {
+    for line in contents.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let _interface = fields.next()?;
+        let destination = fields.next()?;
+        if destination != "00000000" {
+            continue;
+        }
+        let gateway = fields.next()?;
+        let hex = u32::from_str_radix(gateway, 16).ok()?;
+        return Some(Ipv4Addr::from(hex.swap_bytes()));
+    }
+    None
 }
 
 /// Assembles a complete, immediately consumable sing-box config.
@@ -236,6 +308,8 @@ pub fn compile_full_config(
     _caps: &CoreCapabilities,
     tproxy_port: u16,
     mark: u32,
+    dns_provider: DnsProvider,
+    local_dns: Option<LocalDns>,
 ) -> Result<Value> {
     use serde_json::json;
     let outbound = compile_outbound(node)?;
@@ -245,12 +319,58 @@ pub fn compile_full_config(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| "proxy".into());
     let outbounds = vec![json!({ "type": "direct", "tag": "direct" }), outbound];
+    let dns = compile_dns(&outbound_tag, dns_provider, local_dns);
     Ok(json!({
         "log": { "level": "info", "timestamp": true },
         "inbounds": [compile_tproxy_inbound("::", tproxy_port)],
         "outbounds": outbounds,
-        "route": compile_routing(&outbound_tag, mark, true)
+        "route": compile_routing(&outbound_tag, mark, true),
+        "dns": dns
     }))
+}
+
+/// Builds the DNS section that owns queries hijacked by the tproxy inbound
+/// (see the netd ruleset, which intercepts dport 53 before the local bypass).
+/// Queries are answered over a remote DoH server routed *through* the proxy
+/// outbound via `detour` (the `tunnel-dns` server), so resolution never leaks
+/// to the ISP gateway and never loops back into the tproxy. When `local` is
+/// given, a second `local-dns` server (plain UDP on the LAN, dialed via the
+/// `direct` outbound) is added and gets every query whose connection is routed
+/// to the direct outbound -- so once per-domain direct rules exist, e.g. for
+/// streaming or LAN devices pinned to `direct`, they resolve without the
+/// tunnel and without the machine's filtered secure-DNS attempt. Until such
+/// rules exist (no `direct`-routed connections today), the extra server is
+/// dormant but correct.
+pub fn compile_dns(proxy_outbound: &str, provider: DnsProvider, local: Option<LocalDns>) -> Value {
+    let mut servers = vec![json!({
+        "type": "https",
+        "tag": "tunnel-dns",
+        "server": provider.server(),
+        "detour": proxy_outbound
+    })];
+    let mut rules = vec![];
+    if let Some(local) = local {
+        servers.push(json!({
+            "type": "udp",
+            "tag": "local-dns",
+            "server": local.ipv4.to_string(),
+            "server_port": local.port,
+            "detour": "direct"
+        }));
+        rules.push(json!({
+            "outbound": ["direct"],
+            "server": "local-dns"
+        }));
+    }
+    // Explicit fallback: anything not pinned to the direct outbound resolves
+    // through the tunnel (or, with no matching rule yet, the default server).
+    rules.push(json!({ "server": "tunnel-dns" }));
+    json!({
+        "servers": servers,
+        "rules": rules,
+        "strategy": "ipv4_only",
+        "independent_cache": false
+    })
 }
 
 struct OutboundBuilder {
@@ -523,6 +643,42 @@ mod tests {
     }
 
     #[test]
+    fn full_config_accepted_by_real_singbox() {
+        let binary = std::env::var_os("SING_BOX_BIN")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/usr/bin/sing-box"));
+        if !binary.exists() {
+            eprintln!("skipping: no sing-box binary at {}", binary.display());
+            return;
+        }
+        let config = compile_full_config(
+            &node(
+                ProtocolSpec::Shadowsocks(ShadowsocksConfig {
+                    method: ShadowsocksCipher::Chacha20IetfPoly1305,
+                    password: "pass".into(),
+                    plugin: None,
+                    plugin_opts: None,
+                }),
+                TransportSpec::Tcp,
+                SecuritySpec::None,
+            ),
+            &caps(),
+            12345,
+            0x1,
+            DnsProvider::Quad9,
+            Some(LocalDns::new("192.168.1.1".parse().unwrap(), 53)),
+        )
+        .unwrap();
+        SingboxAdapter
+            .validate_config(&binary, &serde_json::to_vec(&config).unwrap())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "real sing-box rejected the full compiled config: {error:#}"
+                )
+            });
+    }
+
+    #[test]
     fn vless_reality_websocket_outbound_shape() {
         let node = node(
             ProtocolSpec::Vless(VlessConfig {
@@ -692,11 +848,66 @@ mod tests {
             TransportSpec::Tcp,
             SecuritySpec::None,
         );
-        let config = compile_full_config(&node, &caps(), 12345, 0x1).unwrap();
+        let config = compile_full_config(
+            &node,
+            &caps(),
+            12345,
+            0x1,
+            DnsProvider::default(),
+            Some(LocalDns::new("192.168.1.1".parse().unwrap(), 53)),
+        )
+        .unwrap();
         assert_eq!(config["inbounds"][0]["type"], "tproxy");
         assert_eq!(config["inbounds"][0]["listen_port"], 12345);
         assert_eq!(config["outbounds"][0]["type"], "direct");
         assert_eq!(config["route"]["default_mark"], 0x1);
         assert_eq!(config["route"]["auto_detect_interface"], true);
+        assert_eq!(config["dns"]["servers"][0]["tag"], "tunnel-dns");
+        assert_eq!(config["dns"]["servers"][0]["detour"], "edge-test");
+        assert_eq!(config["dns"]["servers"][0]["type"], "https");
+        assert_eq!(config["dns"]["servers"][0]["server"], "1.1.1.1");
+        assert_eq!(config["dns"]["servers"][1]["tag"], "local-dns");
+        assert_eq!(config["dns"]["servers"][1]["type"], "udp");
+        assert_eq!(config["dns"]["servers"][1]["server"], "192.168.1.1");
+        assert_eq!(config["dns"]["servers"][1]["detour"], "direct");
+        assert_eq!(config["dns"]["rules"][0]["outbound"][0], "direct");
+        assert_eq!(config["dns"]["rules"][0]["server"], "local-dns");
+        assert_eq!(config["dns"]["rules"][1]["server"], "tunnel-dns");
+    }
+
+    #[test]
+    fn dns_without_local_dns_keeps_single_tunnel_backbone() {
+        let dns = compile_dns("proxy", DnsProvider::Cloudflare, None);
+        assert_eq!(
+            dns["servers"].as_array().map(Vec::len),
+            Some(1),
+            "no local resolver configured -> single tunnel server"
+        );
+        assert_eq!(dns["servers"][0]["tag"], "tunnel-dns");
+        assert_eq!(dns["rules"].as_array().map(Vec::len), Some(1));
+        assert_eq!(dns["rules"][0]["server"], "tunnel-dns");
+    }
+
+    #[test]
+    fn gateway_route_table_is_parsed_le_endian() {
+        // Destination 00000000 is the default route; gateway "0101A8C0" is
+        // 192.168.1.1 in little-endian hex.
+        let table = "\
+Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
+wlan0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
+wlan0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
+";
+        assert_eq!(
+            parse_route_table(table),
+            Some("192.168.1.1".parse().unwrap())
+        );
+        assert_eq!(parse_route_table(table.lines().next().unwrap()), None);
+        assert_eq!(parse_route_table(""), None);
+        assert_eq!(
+            parse_route_table("Iface\nX\t00000000\t0000A8C0\tF"),
+            Some("192.168.0.0".parse().unwrap()),
+            "any zero destination still parses, whatever the interface name"
+        );
+        assert_eq!(parse_route_table("Iface\nX\t00000000\tzzzz\tF"), None);
     }
 }

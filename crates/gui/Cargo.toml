@@ -9,8 +9,11 @@ build = "build.rs"
 anyhow = "1"
 arc-swap = "1"
 crossbeam-queue = "0.3"
+myproxy-controller = { path = "../controller" }
+myproxy-probe = { path = "../probe" }
 myproxy-storage = { path = "../storage" }
 slint = "1.17.1"
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 
 [build-dependencies]
 slint-build = "1.17.1"

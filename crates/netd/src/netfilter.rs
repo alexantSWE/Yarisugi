@@ -191,6 +191,13 @@ fn run_ip(args: &[String]) -> Result<()> {
 ///     proxy core's own connections, which bind SO_MARK) from being re-marked,
 ///     which is what breaks the intercept loop;
 ///   - prerouting stamps intercepted sockets with the same mark value.
+///
+/// DNS handling: loopback/systemd-resolved destinations (`127.0.0.53:53`) fall
+/// inside the default bypass sets, so port 53 is intercepted *before* the
+/// bypass returns. Otherwise every app query would escape to the local resolver
+/// and out to the ISP gateway unencrypted, starving sing-box's `sniff` of the
+/// domain. The core's own DNS sockets carry SO_MARK and hit the leading mark
+/// return, so they are never looped back.
 pub fn render_ruleset(settings: &TProxySettings) -> String {
     let mark = format!("{:#x}", settings.proxy_fwmark);
     let bypass_v4 = cidr_set(&settings.bypass_subnets, LOCAL_BYPASS_V4);
@@ -221,10 +228,11 @@ pub fn render_ruleset(settings: &TProxySettings) -> String {
 \t}}
 \tchain output {{
 \t\ttype route hook output priority mangle; policy accept;
-\t\tip daddr @bypass_v4 return
-\t\tip6 daddr @bypass_v6 return
 \t\tmeta mark {mark} return
-{uid_bypass}\t\tmeta l4proto {{ tcp, udp }} meta mark set {mark} accept
+\t\tmeta l4proto {{ tcp, udp }} th dport 53 meta mark set {mark} accept
+{uid_bypass}\t\tip daddr @bypass_v4 return
+\t\tip6 daddr @bypass_v6 return
+\t\tmeta l4proto {{ tcp, udp }} meta mark set {mark} accept
 \t}}
 }}\n",
         port = settings.tproxy_port,
@@ -265,7 +273,7 @@ mod tests {
     fn ruleset_contains_dual_stack_tproxy_pipeline() {
         let rendered = render_ruleset(&settings(12345, 0x1, 100));
         assert!(rendered.contains("tproxy to :12345"));
-        assert_eq!(rendered.matches("meta mark set 0x1").count(), 2);
+        assert_eq!(rendered.matches("meta mark set 0x1").count(), 3);
         assert_eq!(rendered.matches("meta mark 0x1 return").count(), 2);
         assert!(rendered.contains("meta skuid 1000 return"));
         assert!(rendered.contains("ip daddr @bypass_v4 return"));
@@ -274,6 +282,25 @@ mod tests {
         assert!(rendered.contains("fc00::/7"));
         assert!(rendered.contains("192.168.0.0/16"));
         assert!(rendered.contains("2001:db8::/32"));
+    }
+
+    #[test]
+    fn dns_is_intercepted_before_local_bypass_returns() {
+        let rendered = render_ruleset(&settings(12345, 0x1, 100));
+        let output = &rendered[rendered.find("chain output").unwrap()..];
+        let dns = output.find("th dport 53 meta mark set 0x1").unwrap();
+        let mark_return = output.find("meta mark 0x1 return").unwrap();
+        let bypass_v4 = output.find("ip daddr @bypass_v4 return").unwrap();
+        assert!(mark_return < dns, "core mark return must precede dns interception");
+        assert!(dns < bypass_v4, "dns must be intercepted before the bypass check");
+    }
+
+    #[test]
+    fn uid_bypass_stays_after_dns_interception() {
+        let rendered = render_ruleset(&settings(12345, 0x1, 100));
+        let dns = rendered.find("th dport 53 meta mark set 0x1").unwrap();
+        let uid = rendered.find("meta skuid 1000 return").unwrap();
+        assert!(uid > dns, "uid bypass must not exempt dns");
     }
 
     #[test]

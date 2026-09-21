@@ -52,7 +52,10 @@ pub struct ProbeConfig {
 impl Default for ProbeConfig {
     fn default() -> Self {
         Self {
-            concurrency_limit: 2048,
+            // Modest: a firewalled ISP will start dropping/reputation-burning a
+            // client that hammers thousands of peer addresses at once. Used by
+            // the tiered shortlist's cheap sweep and the GUI burst alike.
+            concurrency_limit: 512,
             connect_timeout: Duration::from_millis(800),
             udp_reply_window: Duration::from_millis(300),
         }

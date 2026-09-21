@@ -20,11 +20,14 @@ export component MainWindow inherits Window {
     in property <int> total_nodes_count: 0;
     in property <string> active_node_name: "No node selected";
     in property <string> status_text: "Network backend unavailable";
+    in property <string> watchdog_status_text: "Egress watchdog: not running";
 
     callback search_changed(string);
     callback sort_changed(string);
     callback node_selected(int);
     callback probe_all_clicked();
+    callback import_subscription(string);
+    callback rescore_egress_clicked();
 
     VerticalLayout {
         padding: 16px;
@@ -62,6 +65,30 @@ export component MainWindow inherits Window {
         }
 
         HorizontalLayout {
+            height: 32px;
+            spacing: 10px;
+            Rectangle {
+                width: 460px;
+                background: #14181f;
+                border-color: #37613d;
+                border-width: 1px;
+                border-radius: 6px;
+                Text {
+                    text: root.watchdog_status_text;
+                    color: #8fc98f;
+                    horizontal-alignment: left;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    font-size: 12px;
+                }
+            }
+            Button {
+                text: "Rescore egress";
+                clicked => { root.rescore_egress_clicked(); }
+            }
+        }
+
+        HorizontalLayout {
             height: 36px;
             spacing: 10px;
             LineEdit {
@@ -73,6 +100,19 @@ export component MainWindow inherits Window {
             Button { text: "Country"; clicked => { root.sort_changed("country"); } }
             Button { text: "A-Z"; clicked => { root.sort_changed("name"); } }
             Button { text: "Health"; clicked => { root.sort_changed("health"); } }
+        }
+
+        HorizontalLayout {
+            height: 36px;
+            spacing: 10px;
+            import := LineEdit {
+                placeholder-text: "Paste subscription link or raw text to import...";
+                horizontal-stretch: 1;
+            }
+            Button {
+                text: "Import";
+                clicked => { root.import_subscription(import.text); }
+            }
         }
 
         Text {
