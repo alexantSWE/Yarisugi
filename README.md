@@ -93,7 +93,3 @@ cargo run -p myproxy-probe -- path/to/subscription.txt --concurrency 512
 
 Licensed under the [MIT License](LICENSE).
 ```
-
-* **Memory Model Precision:** *"Zero-Allocation Data Layer"* $\to$ *"Low-Allocation Data Layer"*.
-* **Prober Accurately Scoped:** Explicitly labeled as an *"L4 Preflight CLI"* rather than implying full L7 quorum checks are exposed in that command.
-* **Kernel Note Refined:** Changed from a hard prerequisite to *"recommended for modern `sock_diag` and `pidfd` features"*.
