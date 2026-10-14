@@ -560,7 +560,7 @@ impl Default for PreflightConfig {
 #[derive(Debug, Clone, Copy)]
 struct CheapOutcome {
     latency: Option<u16>,
-    alive: bool,
+    dead: bool,
 }
 
 /// The cheap tier: socket-level liveness for the whole catalog in one bounded
@@ -585,18 +585,19 @@ fn cheap_sweep(candidates: &[CanonicalNode], preflight: &PreflightConfig) -> Vec
         .into_iter()
         .map(|outcome| CheapOutcome {
             latency: outcome.latency_ms,
-            alive: outcome.alive,
+            dead: outcome.is_dead(),
         })
         .collect()
 }
 
-/// Pure decision over sweep rows: the fastest `finalists` that are alive
-/// (UDP nodes with a live-but-wordless reply sort behind ones with a measured
-/// latency). Off-by-one guarantees and wraparounds live here, not in the
-/// async glue.
+/// Pure decision over sweep rows: the fastest `finalists` that are not proven
+/// dead. Unconfirmed UDP targets (silent, no RTT) are still promotable -- they
+/// sort behind any node with a measured latency, but dropping them here would
+/// silently eliminate every Hysteria2/TUIC/WireGuard candidate before the heavy
+/// tier ever gets a chance to prove it.
 fn select_finalists(outcomes: &[CheapOutcome], finalists: usize) -> Vec<usize> {
     let mut order = (0..outcomes.len())
-        .filter(|&index| outcomes[index].alive)
+        .filter(|&index| !outcomes[index].dead)
         .collect::<Vec<_>>();
     order.sort_by_key(|&index| outcomes[index].latency.unwrap_or(u16::MAX));
     order.truncate(finalists);
@@ -604,10 +605,10 @@ fn select_finalists(outcomes: &[CheapOutcome], finalists: usize) -> Vec<usize> {
     order
 }
 
-/// Two-tier shortlist: sweep everything cheaply, promote the fastest-alive
-/// finalists to a full quorum scatter, and rank those. Bounded heavy load
-/// regardless of catalog size. Returns `[]` untouched when the sweep finds
-/// nothing alive (every candidate confirmed dead at the socket level).
+/// Two-tier shortlist: sweep everything cheaply, promote the fastest
+/// not-dead finalists to a full quorum scatter, and rank those. Bounded heavy
+/// load regardless of catalog size. Returns `[]` untouched when the sweep
+/// confirms every candidate dead at the socket level.
 pub fn tiered_shortlist(
     controller: &ProxyController,
     candidates: &[CanonicalNode],
@@ -1175,23 +1176,40 @@ mod tests {
     }
 
     #[test]
-    fn select_finalists_promotes_fastest_alive_only() {
+    fn select_finalists_promotes_fastest_not_dead_only() {
         let outcomes = vec![
-            CheapOutcome { latency: Some(900), alive: true },
-            CheapOutcome { latency: Some(40), alive: true },
-            CheapOutcome { latency: None, alive: false },
-            CheapOutcome { latency: None, alive: true }, // UDP: alive, wordless
-            CheapOutcome { latency: Some(120), alive: true },
+            CheapOutcome { latency: Some(900), dead: false },
+            CheapOutcome { latency: Some(40), dead: false },
+            CheapOutcome { latency: None, dead: true },
+            // UDP that stayed silent: unconfirmed, not dead -> must stay promotable.
+            CheapOutcome { latency: None, dead: false },
+            CheapOutcome { latency: Some(120), dead: false },
         ];
-        // Fastest three alive, ascending by node index for stable ordering.
+        // Fastest three, ascending by node index for stable ordering.
         let finalists = select_finalists(&outcomes, 3);
         assert_eq!(finalists, vec![0, 1, 4]);
-        // A lax cap promotes every live node.
+        // A lax cap promotes every node that was not proven dead.
         let finalists = select_finalists(&outcomes, 20);
         assert_eq!(finalists, vec![0, 1, 3, 4]);
-        // Nothing alive, nothing promoted.
+        // Nothing but a dead node, nothing promoted.
         let finalists = select_finalists(&outcomes[2..3], 3);
         assert!(finalists.is_empty());
+    }
+
+    #[test]
+    fn unconfirmed_udp_is_never_reported_as_alive() {
+        // Regression guard: a silent UDP target must not be promoted as a
+        // proven-healthy node. It is promoted as *unknown* (dead == false) and
+        // sorted behind measured latencies, but never carries a latency.
+        let outcomes = vec![
+            CheapOutcome { latency: Some(40), dead: false },
+            CheapOutcome { latency: None, dead: false },
+        ];
+        let finalists = select_finalists(&outcomes, 2);
+        assert_eq!(finalists, vec![0, 1]);
+        // With room for one slot, the measured-latency node wins outright.
+        let finalists = select_finalists(&outcomes, 1);
+        assert_eq!(finalists, vec![0]);
     }
 
     #[test]

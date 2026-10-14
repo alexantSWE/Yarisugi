@@ -26,8 +26,35 @@ pub enum ProbeFailure {
     Refused,
     TimedOut,
     Unresolvable,
+    /// The probe sent a datagram and got no reply. This is *not* proof of
+    /// liveness -- a silent firewall drop and a live-but-indifferent service
+    /// look identical at L4.
     NoReply,
     Io,
+}
+
+/// How much a probe actually proved about a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeConfidence {
+    /// Verified end-to-end (a real protocol/egress transcript matched).
+    Confirmed,
+    /// Transport reachability only (TCP connect, or a UDP datagram came back).
+    SocketReachable,
+    /// Neither proven reachable nor refuted: silence we cannot interpret.
+    Unconfirmed,
+    /// Proven dead (refused, timed out, unresolvable, etc.).
+    Unreachable,
+}
+
+impl ProbeConfidence {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Confirmed => 3,
+            Self::SocketReachable => 2,
+            Self::Unconfirmed => 1,
+            Self::Unreachable => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -35,11 +62,27 @@ pub struct ProbeOutcome {
     pub label: String,
     pub country_code: [u8; 2],
     pub protocol: &'static str,
-    /// Socket round-trip in ms; missing for UDP targets that silently passed
-    /// (L4 UDP cannot measure RTT without a real transcript).
+    /// Socket round-trip in ms; missing when no RTT was measurable.
     pub latency_ms: Option<u16>,
-    pub alive: bool,
+    pub confidence: ProbeConfidence,
     pub failure: Option<ProbeFailure>,
+}
+
+impl ProbeOutcome {
+    pub fn alive(&self) -> bool {
+        matches!(
+            self.confidence,
+            ProbeConfidence::Confirmed | ProbeConfidence::SocketReachable
+        )
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.confidence == ProbeConfidence::Unreachable
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        self.confidence == ProbeConfidence::Unconfirmed
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -77,66 +120,117 @@ impl ProbeEngine {
     }
 
     pub async fn probe(&self, node: &CanonicalNode, depth: ProbeDepth) -> ProbeOutcome {
-        let (latency, failure) = match depth {
-            ProbeDepth::L4Ping => self.ping(&node.endpoint, &node.protocol).await,
-            _ => (None, Some(ProbeFailure::Io)),
-        };
-        build_outcome(node, latency, failure)
+        match depth {
+            ProbeDepth::L4Ping => build_outcome(node, self.ping(&node.endpoint, &node.protocol).await),
+            // Deeper tiers are not wired yet; report unknown rather than a fake verdict.
+            _ => build_outcome(
+                node,
+                AddressProbe {
+                    latency_ms: None,
+                    confidence: ProbeConfidence::Unconfirmed,
+                    failure: Some(ProbeFailure::Io),
+                },
+            ),
+        }
     }
 
-    async fn ping(
-        &self,
-        endpoint: &EndpointTarget,
-        protocol: &ProtocolSpec,
-    ) -> (Option<u16>, Option<ProbeFailure>) {
+    async fn ping(&self, endpoint: &EndpointTarget, protocol: &ProtocolSpec) -> AddressProbe {
         match endpoint {
             EndpointTarget::Ip(address) => self.probe_addr(address, protocol).await,
             EndpointTarget::Domain { host, port } => {
                 let Ok(addresses) = lookup_host((host.as_ref(), *port)).await else {
-                    return (None, Some(ProbeFailure::Unresolvable));
+                    return AddressProbe {
+                        latency_ms: None,
+                        confidence: ProbeConfidence::Unreachable,
+                        failure: Some(ProbeFailure::Unresolvable),
+                    };
                 };
                 let addresses: Vec<SocketAddr> = addresses.collect();
                 if addresses.is_empty() {
-                    return (None, Some(ProbeFailure::Unresolvable));
+                    return AddressProbe {
+                        latency_ms: None,
+                        confidence: ProbeConfidence::Unreachable,
+                        failure: Some(ProbeFailure::Unresolvable),
+                    };
                 }
+                let mut best: Option<AddressProbe> = None;
                 let mut first_failure = None;
                 for address in addresses {
-                    let (latency, failure) = self.probe_addr(&address, protocol).await;
-                    if latency.is_some() || failure.is_none() {
-                        return (latency, failure);
+                    let candidate = self.probe_addr(&address, protocol).await;
+                    let dead = candidate.confidence == ProbeConfidence::Unreachable;
+                    let better = match &best {
+                        None => true,
+                        Some(current) => {
+                            candidate.confidence.rank() > current.confidence.rank()
+                        }
+                    };
+                    if dead && first_failure.is_none() {
+                        first_failure = candidate.failure;
                     }
-                    if first_failure.is_none() {
-                        first_failure = failure;
+                    if better {
+                        best = Some(candidate);
                     }
                 }
-                (None, first_failure.or(Some(ProbeFailure::Refused)))
+                match best {
+                    Some(probe) => probe,
+                    None => AddressProbe {
+                        latency_ms: None,
+                        confidence: ProbeConfidence::Unreachable,
+                        failure: first_failure.or(Some(ProbeFailure::Refused)),
+                    },
+                }
             }
         }
     }
 
-    async fn probe_addr(
-        &self,
-        address: &SocketAddr,
-        protocol: &ProtocolSpec,
-    ) -> (Option<u16>, Option<ProbeFailure>) {
+    async fn probe_addr(&self, address: &SocketAddr, protocol: &ProtocolSpec) -> AddressProbe {
         let _permit = match self.semaphore.acquire().await {
             Ok(permit) => permit,
-            Err(_) => return (None, Some(ProbeFailure::Io)),
+            Err(_) => {
+                return AddressProbe {
+                    latency_ms: None,
+                    confidence: ProbeConfidence::Unreachable,
+                    failure: Some(ProbeFailure::Io),
+                }
+            }
         };
         match protocol {
             ProtocolSpec::Shadowsocks(_)
             | ProtocolSpec::Vless(_)
             | ProtocolSpec::Vmess(_)
             | ProtocolSpec::Trojan(_) => match self.tcp_connect(address).await {
-                Ok(rtt) => (Some(rtt), None),
-                Err(failure) => (None, Some(failure)),
+                Ok(rtt) => AddressProbe {
+                    latency_ms: Some(rtt),
+                    confidence: ProbeConfidence::SocketReachable,
+                    failure: None,
+                },
+                Err(failure) => AddressProbe {
+                    latency_ms: None,
+                    confidence: ProbeConfidence::Unreachable,
+                    failure: Some(failure),
+                },
             },
             ProtocolSpec::Hysteria2(_)
             | ProtocolSpec::Tuic(_)
             | ProtocolSpec::WireGuard(_) => match self.udp_reach(address).await {
-                Ok(Some(rtt)) => (Some(rtt), None),
-                Ok(None) => (None, None),
-                Err(failure) => (None, Some(failure)),
+                Ok(Some(rtt)) => AddressProbe {
+                    latency_ms: Some(rtt),
+                    confidence: ProbeConfidence::SocketReachable,
+                    failure: None,
+                },
+                // Silence proves nothing: the datagram may have been swallowed by
+                // a firewall, or the service may simply not answer a meaningless
+                // 1-byte probe. This is "unknown", not "alive".
+                Ok(None) => AddressProbe {
+                    latency_ms: None,
+                    confidence: ProbeConfidence::Unconfirmed,
+                    failure: Some(ProbeFailure::NoReply),
+                },
+                Err(failure) => AddressProbe {
+                    latency_ms: None,
+                    confidence: ProbeConfidence::Unreachable,
+                    failure: Some(failure),
+                },
             },
         }
     }
@@ -207,23 +301,22 @@ pub async fn probe_batch(
     results
 }
 
-fn build_outcome(
-    node: &CanonicalNode,
-    latency: Option<u16>,
+/// Internal result of probing a single address, before it is wrapped in a
+/// `ProbeOutcome` with node metadata.
+struct AddressProbe {
+    latency_ms: Option<u16>,
+    confidence: ProbeConfidence,
     failure: Option<ProbeFailure>,
-) -> ProbeOutcome {
-    let udp = matches!(
-        node.protocol,
-        ProtocolSpec::Hysteria2(_) | ProtocolSpec::Tuic(_) | ProtocolSpec::WireGuard(_)
-    );
-    let alive = latency.is_some() || (udp && failure.is_none());
+}
+
+fn build_outcome(node: &CanonicalNode, ping: AddressProbe) -> ProbeOutcome {
     ProbeOutcome {
         label: node.meta.label.to_string(),
         country_code: node.meta.country_code,
         protocol: protocol_name(&node.protocol),
-        latency_ms: latency,
-        alive,
-        failure,
+        latency_ms: ping.latency_ms,
+        confidence: ping.confidence,
+        failure: ping.failure,
     }
 }
 
@@ -301,7 +394,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let node = tcp_node("loop", address);
         let outcome = engine().probe(&node, ProbeDepth::L4Ping).await;
-        assert!(outcome.alive);
+        assert!(outcome.alive());
+        assert_eq!(outcome.confidence, ProbeConfidence::SocketReachable);
         assert!(outcome.latency_ms.is_some());
         assert!(outcome.failure.is_none());
     }
@@ -313,7 +407,9 @@ mod tests {
         drop(listener);
         let node = tcp_node("closed", address);
         let outcome = engine().probe(&node, ProbeDepth::L4Ping).await;
-        assert!(!outcome.alive);
+        assert!(!outcome.alive());
+        assert!(outcome.is_dead());
+        assert_eq!(outcome.confidence, ProbeConfidence::Unreachable);
         assert_eq!(outcome.failure, Some(ProbeFailure::Refused));
     }
 
@@ -333,35 +429,43 @@ mod tests {
         )
         .unwrap();
         let outcome = engine().probe(&node, ProbeDepth::L4Ping).await;
-        assert!(!outcome.alive);
+        assert!(!outcome.alive());
+        assert!(outcome.is_dead());
+        assert_eq!(outcome.confidence, ProbeConfidence::Unreachable);
         assert_eq!(outcome.failure, Some(ProbeFailure::Unresolvable));
     }
 
     #[tokio::test]
-    async fn udp_silent_pass_counts_as_alive() {
+    async fn udp_silence_is_unconfirmed_not_alive() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let address = socket.local_addr().unwrap();
         let node = udp_node("hy2", address);
         let outcome = engine().probe(&node, ProbeDepth::L4Ping).await;
-        assert!(outcome.alive);
+        assert!(!outcome.alive());
+        assert!(outcome.is_unknown());
+        assert_eq!(outcome.confidence, ProbeConfidence::Unconfirmed);
+        assert_eq!(outcome.failure, Some(ProbeFailure::NoReply));
         assert!(outcome.latency_ms.is_none());
-        assert!(outcome.failure.is_none());
     }
 
     #[tokio::test]
     async fn udp_icmp_refused_on_closed_loopback_port() {
         let node = udp_node("hy2-dead", "127.0.0.1:62999".parse().unwrap());
         let outcome = engine().probe(&node, ProbeDepth::L4Ping).await;
-        assert!(!outcome.alive);
+        assert!(!outcome.alive());
+        assert!(outcome.is_dead());
+        assert_eq!(outcome.confidence, ProbeConfidence::Unreachable);
         assert_eq!(outcome.failure, Some(ProbeFailure::Refused));
     }
 
     #[tokio::test]
-    async fn unimplemented_depths_report_failure() {
+    async fn unimplemented_depths_report_unknown_not_alive() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let node = tcp_node("deep", listener.local_addr().unwrap());
         let outcome = engine().probe(&node, ProbeDepth::FullEgress204).await;
-        assert!(!outcome.alive);
+        assert!(!outcome.alive());
+        assert!(outcome.is_unknown());
+        assert_eq!(outcome.confidence, ProbeConfidence::Unconfirmed);
     }
 
     #[tokio::test]
@@ -373,7 +477,7 @@ mod tests {
             SocketAddr::new(listener.local_addr().unwrap().ip(), 1),
         );
         let results = probe_batch(&engine(), &[good, bad], ProbeDepth::L4Ping).await;
-        let alive = results.iter().filter(|outcome| outcome.alive).count();
+        let alive = results.iter().filter(|outcome| outcome.alive()).count();
         assert_eq!(alive, 1);
     }
 }

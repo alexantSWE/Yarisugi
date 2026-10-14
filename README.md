@@ -19,7 +19,7 @@ A green ping number to `cp.cloudflare.com` or `gstatic.com/generate_204` proves 
 * **Public List Attrition:** Publicly aggregated subscription lists consistently show baseline survival rates in the low single digits, with high rates of functional duplicates sharing identical server endpoints under cosmetic renames.
 * **Probing Anomaly Signatures:** Blasting thousands of concurrent, unpadded HTTP pings with identical headers across dead endpoints creates obvious traffic-fingerprinting patterns for ISP DPI.
 
-**How Yarisugi addresses this:** The architecture uses functional identity deduplication (matching endpoints and protocol hashes rather than names), cheap L4 preflight sweeps, and multi-operator quorum verification where both status codes and body signatures must match before a node is marked viable.
+**How Yarisugi addresses this:** The architecture uses functional identity deduplication (matching endpoints and protocol hashes rather than names), cheap L4 preflight sweeps, and multi-operator quorum verification where both status codes and body signatures must match before a node is marked viable. See [We Don't Tell No Lies](#we-dont-tell-no-lies) for exactly what each tier is allowed to claim.
 
 ### 2. Protocol Semantics Matter to Middleboxes
 Treating proxy nodes as generic `(ip, port, protocol)` tuples ignores how modern DPI middleboxes classify and degrade traffic:
@@ -52,11 +52,76 @@ Modern cores like `sing-box` offer production-grade transparent routing (TPROXY)
 | Subsystem | Status | Implementation Details |
 | :--- | :--- | :--- |
 | **Storage & IR Engine** | Active | Canonical node normalization, functional hash deduplication, SQLite persistence, and dense SoA snapshots. |
-| **Virtual Viewport UI** | Active | Slint-based viewport supporting 50,000+ node models, background projection workers, and non-blocking search/sort. |
+| **Virtual Viewport UI** | Active | Slint-based viewport supporting 50,000+ node models, background projection workers, and non-blocking search/sort. Benchmarked at 100k rows. |
 | **Ingestion Engine** | Active | Line-delimited URI bundle parser and Clash/Mihomo YAML proxy reader. |
-| **Routing Control Plane (`netd`)** | Phase 1 (Stub) | IPC wire protocol, authentication, session ownership, and watchdog rollback engine. |
-| **Network Backend** | In Progress | Transitioning from the development no-op backend to live dual-stack `nftables` TPROXY and policy routing. |
-| **Core Adapter & Supervisor** | In Progress | `sing-box` outbound configuration compilation, atomic config validation, and SIGHUP process management. |
+| **Routing Control Plane (`netd`)** | Active | IPC wire protocol, UID authentication, session ownership, and watchdog rollback engine. |
+| **Network Backend** | Active | Dual-stack `nftables` TPROXY, `SO_MARK` loop prevention, policy routing, and DNS interception. |
+| **Core Adapter & Supervisor** | Active | `sing-box` outbound configuration compilation, atomic config validation, and SIGHUP process management. |
+| **Verification Ladder** | Active | L4 socket preflight (all nodes) → per-protocol egress quorum (finalists only). See *We Don't Tell No Lies* below. |
+| **In-kernel Telemetry** | Active | `INET_DIAG_REQ_V2` via Netlink `sock_diag`, plus `pidfd_getfd` for supervised core sockets. |
+| **Protocol handshake tier** | Planned | Per-protocol handshake probing; blocked on uTLS fingerprint replay, which stock `rustls` cannot reproduce. |
+
+---
+
+## We Don't Tell No Lies
+
+This is the load-bearing design rule of the project. A proxy client that shows a
+green ping for a node that cannot carry a single packet is worse than one that
+shows nothing, because the user acts on it. Yarisugi therefore never collapses
+"something answered" and "the tunnel works" into a single number.
+
+### Two tiers, two different claims
+
+| Tier | Scope | What it actually proves | What it cannot prove |
+| :--- | :--- | :--- | :--- |
+| **L4 socket preflight** | every node, cheap | The transport answered: a TCP connect completed, or a UDP datagram came back. Measures the **socket** round trip. | That the proxy protocol authenticates, or that traffic egresses. |
+| **Egress quorum scatter** | finalists only | A real request through a real `sing-box` local SOCKS testbed returned the **expected status code *and* the expected body**. A quorum of independent operators must agree. | Anything about a node that never made the shortlist. |
+
+The heavy tier exists precisely because the cheap tier cannot catch the
+Anycast Edge Fallacy, captive portals that answer `HTTP 200` to everything, or
+the REALITY decoy trap (where an unauthorized handshake is transparently
+forwarded to the server's fallback site and returns a perfectly valid
+third-party certificate). The heavy tier drives the **real core**, so a failed
+authentication cannot masquerade as a success.
+
+### Confidence is explicit, never inferred
+
+`ProbeOutcome` carries a `ProbeConfidence` rather than a boolean:
+
+```rust
+pub enum ProbeConfidence {
+    Confirmed,        // verified end-to-end by a real transcript
+    SocketReachable,  // the transport answered; reachability only
+    Unconfirmed,      // proved nothing either way (e.g. silent UDP)
+    Unreachable,      // proven dead: refused, timed out, unresolvable
+}
+```
+
+`Unconfirmed` is the variant that matters most. A UDP probe that gets no reply
+has learned **nothing**: a hostile ISP silently dropping high-entropy UDP on a
+non-standard port looks exactly like a healthy Hysteria2 server that ignores a
+meaningless 1-byte datagram. Yarisugi refuses to score silence as success, and
+refuses to call it failure either. It stays in the shortlist (sorting behind
+anything actually measured) so the heavy tier can resolve it honestly, but the
+UI never paints it as healthy.
+
+### How this reaches the screen
+
+* **Unconfirmed probes write no metric at all.** The row stays `—` (untested).
+  Inventing a score would be the lie we are avoiding.
+* **Socket-only health is capped** at 55, well below the verified ceiling of
+  100, so "reachable" can never out-rank "works" no matter how good the round
+  trip looked.
+* **Socket-only readings render as `~40 ms`** in a neutral slate colour rather
+  than a green `40 ms`. Verified readings drop the prefix and use the normal
+  green/amber/red scale.
+* **Every row carries a provenance badge** — `✓` for an egress-verified node,
+  `≈` for socket reachability only, blank when nothing has been measured yet —
+  with a legend beneath the viewport. The badge makes the tier legible at a
+  glance so the distinction cannot be lost by ignoring the colour.
+* **Every latency carries its provenance** (`MetricsArena::verified`) from the
+  prober through the COW snapshot layer to the viewport, so the distinction
+  survives a full catalog refresh instead of living only in a local variable.
 
 ---
 
@@ -86,6 +151,23 @@ Run the asynchronous L4 connectivity sweep directly on a subscription file:
 ```bash
 cargo run -p myproxy-probe -- path/to/subscription.txt --concurrency 512
 ```
+
+Every line reports one of three verdicts, and the tool prints a reminder that
+none of them is a verified tunnel:
+
+```text
+[REACH ]    42ms  vless     @DE  🇩🇪 Frankfurt 01            socket answered
+[UNKNWN]     --  hysteria2 @US  🇺🇸 Los Angeles (no reply)    no reply
+[DEAD  ]     --  trojan    @NL  🇳🇱 Amsterdam 03            connection refused
+
+3 reachable, 1 unconfirmed, 12 dead (of 40 scanned; 4 skipped, 6 duplicates)
+```
+
+`REACH` means the transport answered and nothing more. To turn a reachability
+signal into a verified verdict, run the egress quorum instead (the
+**Rescore egress** button in the GUI), which drives a real `sing-box` local
+SOCKS testbed and requires a quorum of independent operators to agree on both
+status code and response body.
 
 ---
 

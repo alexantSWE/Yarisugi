@@ -193,7 +193,9 @@ impl Model for VirtualNodeModel {
             .get(dense_index)
             .copied()
             .unwrap_or(UNTESTED_LATENCY);
-        let (latency_text, latency_color) = latency_display(latency);
+        let verified = metrics.is_verified(dense_index);
+        let (latency_text, latency_color) = latency_display(latency, verified);
+        let (badge_text, badge_color) = provenance_badge(latency, verified);
         let country = std::str::from_utf8(&store.country_codes[dense_index]).unwrap_or("UN");
         let node_id = store.node_ids[dense_index];
         Some(NodeRowData {
@@ -204,6 +206,8 @@ impl Model for VirtualNodeModel {
             latency_text,
             latency_color,
             is_active: *self.active_node_id.borrow() == Some(node_id),
+            badge_text,
+            badge_color,
         })
     }
 
@@ -212,10 +216,26 @@ impl Model for VirtualNodeModel {
     }
 }
 
-fn latency_display(latency: u16) -> (SharedString, Color) {
+/// Renders a latency reading, distinguishing a verified egress measurement
+/// from a socket-level reachability probe.
+///
+/// Unverified readings get a `~` prefix and a neutral slate colour: they are a
+/// real socket round-trip, but they say nothing about whether the tunnel
+/// carries traffic, and the UI must not imply otherwise.
+fn latency_display(latency: u16, verified: bool) -> (SharedString, Color) {
     if latency == UNTESTED_LATENCY {
-        (SharedString::from("—"), Color::from_rgb_u8(113, 113, 122))
-    } else if latency < 150 {
+        return (
+            SharedString::from("—"),
+            Color::from_rgb_u8(113, 113, 122),
+        );
+    }
+    if !verified {
+        return (
+            SharedString::from(format!("~{latency} ms")),
+            Color::from_rgb_u8(125, 132, 148),
+        );
+    }
+    if latency < 150 {
         (
             SharedString::from(format!("{latency} ms")),
             Color::from_rgb_u8(70, 167, 88),
@@ -230,5 +250,80 @@ fn latency_display(latency: u16) -> (SharedString, Color) {
             SharedString::from(format!("{latency} ms")),
             Color::from_rgb_u8(229, 72, 77),
         )
+    }
+}
+
+/// Per-row provenance marker, so the tier that produced a reading is visible
+/// at a glance and not inferred from the colour of the latency alone.
+///
+/// An untested row stays blank: there is nothing to claim, so nothing is
+/// claimed. A socket-only reading gets an approximation sign, because that is
+/// exactly what it is.
+fn provenance_badge(latency: u16, verified: bool) -> (SharedString, Color) {
+    if latency == UNTESTED_LATENCY {
+        (SharedString::from(""), Color::from_rgb_u8(63, 63, 70))
+    } else if verified {
+        (
+            SharedString::from("✓"),
+            Color::from_rgb_u8(70, 167, 88),
+        )
+    } else {
+        (
+            SharedString::from("≈"),
+            Color::from_rgb_u8(125, 132, 148),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_of(latency: u16, verified: bool) -> String {
+        latency_display(latency, verified).0.to_string()
+    }
+
+    fn badge_of(latency: u16, verified: bool) -> String {
+        provenance_badge(latency, verified).0.to_string()
+    }
+
+    #[test]
+    fn untested_never_shows_a_number() {
+        assert_eq!(text_of(UNTESTED_LATENCY, true), "—");
+        assert_eq!(text_of(UNTESTED_LATENCY, false), "—");
+    }
+
+    #[test]
+    fn socket_only_reading_is_marked_approximate() {
+        // A fast socket connect must not read like a verified fast tunnel.
+        assert_eq!(text_of(40, false), "~40 ms");
+        assert_eq!(text_of(40, true), "40 ms");
+    }
+
+    #[test]
+    fn verified_readings_never_carry_the_approximation_marker() {
+        for latency in [1u16, 149, 150, 349, 350, 5000] {
+            assert!(
+                !text_of(latency, true).starts_with('~'),
+                "verified {latency} ms must not be marked approximate"
+            );
+        }
+    }
+
+    #[test]
+    fn badge_matches_the_provenance_of_the_reading() {
+        assert_eq!(badge_of(40, true), "✓");
+        assert_eq!(badge_of(40, false), "≈");
+        // Nothing measured, nothing to certify.
+        assert_eq!(badge_of(UNTESTED_LATENCY, true), "");
+        assert_eq!(badge_of(UNTESTED_LATENCY, false), "");
+    }
+
+    /// A stale `verified` flag must never survive on an untested row.
+    #[test]
+    fn untested_rows_carry_no_badge_regardless_of_flag() {
+        for verified in [true, false] {
+            assert_eq!(badge_of(UNTESTED_LATENCY, verified), "");
+        }
     }
 }

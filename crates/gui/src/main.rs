@@ -110,6 +110,9 @@ fn main() -> Result<()> {
                         .build();
                     match runtime {
                         Ok(runtime) => {
+                            let mut reachable = 0usize;
+                            let mut unknown = 0usize;
+                            let mut dead = 0usize;
                             let engine = ProbeEngine::new(ProbeConfig {
                                 // The whole catalog at once; keep the socket
                                 // barrage polite and below the firewall's
@@ -122,18 +125,35 @@ fn main() -> Result<()> {
                             let outcomes = runtime
                                 .block_on(probe_batch(&engine, &nodes, ProbeDepth::L4Ping));
                             for ((id, _node), outcome) in targets.iter().zip(outcomes.iter()) {
+                                // An unconfirmed target proved nothing, so we
+                                // write no metric at all: leaving the row at
+                                // "untested" is honest, inventing a score is not.
+                                if outcome.is_unknown() {
+                                    unknown += 1;
+                                    continue;
+                                }
                                 let latency_ms = outcome.latency_ms.unwrap_or(UNTESTED_LATENCY);
-                                let health_score = probe_health(outcome.alive, outcome.latency_ms);
+                                let health_score =
+                                    reachability_health(outcome.alive(), outcome.latency_ms);
+                                if outcome.alive() {
+                                    reachable += 1;
+                                } else {
+                                    dead += 1;
+                                }
                                 sender.enqueue(ProbeResult {
                                     node_id: *id,
                                     latency_ms,
                                     health_score,
+                                    verified: false,
                                 });
                             }
                             if let Some(app) = weak.upgrade() {
                                 app.set_status_text(
-                                    format!("Probed {} nodes via socket health", targets.len())
-                                        .into(),
+                                    format!(
+                                        "Socket preflight: {reachable} reachable, {unknown} unconfirmed, {dead} dead (of {}) — reachability only, run Rescore egress for verified quality",
+                                        targets.len()
+                                    )
+                                    .into(),
                                 );
                             }
                         }
@@ -153,7 +173,9 @@ fn main() -> Result<()> {
                         sender.enqueue(ProbeResult {
                             node_id: id,
                             latency_ms: latency,
-                            health_score: (100 - (latency / 8).min(90)) as u8,
+                            health_score: reachability_health(true, Some(latency)),
+                            // Fabricated numbers are never "verified".
+                            verified: false,
                         });
                     }
                     if let Some(app) = weak.upgrade() {
@@ -213,7 +235,8 @@ fn main() -> Result<()> {
                             sender.enqueue(ProbeResult {
                                 node_id: *id,
                                 latency_ms: latency.unwrap_or(UNTESTED_LATENCY),
-                                health_score: probe_health(score.passes, latency),
+                                health_score: verified_health(score.passes, latency),
+                                verified: score.passes,
                             });
                             writes += 1;
                         }
@@ -276,13 +299,31 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn probe_health(alive: bool, latency_ms: Option<u16>) -> u8 {
+/// Highest health a *socket-only* result may claim.
+///
+/// A TCP connect or a UDP answer proves that something is listening, not that
+/// the proxy carries traffic. Capping unverified nodes below the verified
+/// ceiling keeps "reachable" and "works" from collapsing into one number.
+const REACHABILITY_HEALTH_CEILING: i32 = 55;
+
+/// Health for a socket-level preflight result. Deliberately capped well below
+/// the verified ceiling: this measures reachability, never quality.
+fn reachability_health(alive: bool, latency_ms: Option<u16>) -> u8 {
     if !alive {
+        return 0;
+    }
+    let latency = latency_ms.unwrap_or(400) as i32;
+    (REACHABILITY_HEALTH_CEILING - latency / 12).clamp(0, REACHABILITY_HEALTH_CEILING) as u8
+}
+
+/// Health for a node whose egress was verified by the quorum scatter, where
+/// both the status code and the response body had to match.
+fn verified_health(passes: bool, latency_ms: Option<u16>) -> u8 {
+    if !passes {
         return 0;
     }
     match latency_ms {
         Some(latency) => (100 - (latency / 8).min(90)) as u8,
-        // Reachable but silent (UDP without a transcript): healthy, unknown rtt.
         None => 100,
     }
 }
@@ -374,4 +415,54 @@ fn demo_store(count: usize) -> DenseNodeStore {
             source_sub_ids: vec![(offset % 3 + 1) as u16],
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The honesty invariant: a socket-only reading must never out-score a
+    /// verified one, no matter how good its round trip looks. This is what
+    /// stops a 12 ms TCP handshake on a honeypot from being presented as a
+    /// better node than one the quorum scatter actually proved.
+    #[test]
+    fn socket_only_health_never_exceeds_verified_health() {
+        for latency in [0u16, 1, 20, 50, 100, 200, 400, 800, 2000] {
+            let socket_only = reachability_health(true, Some(latency));
+            let verified = verified_health(true, Some(latency));
+            assert!(
+                socket_only < verified,
+                "socket-only {socket_only} must not reach verified {verified} at {latency}ms"
+            );
+            assert!(
+                (socket_only as i32) <= REACHABILITY_HEALTH_CEILING,
+                "socket-only health escaped its ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_latency_is_not_treated_as_perfect() {
+        // Reachable but with no measurable RTT (silent UDP): strictly better
+        // than dead, strictly worse than anything actually measured.
+        let unknown_rtt = reachability_health(true, None);
+        assert!(unknown_rtt > 0);
+        assert!(unknown_rtt <= REACHABILITY_HEALTH_CEILING as u8);
+        assert!(unknown_rtt < verified_health(true, Some(500)));
+    }
+
+    #[test]
+    fn dead_is_always_zero() {
+        assert_eq!(reachability_health(false, Some(1)), 0);
+        assert_eq!(reachability_health(false, None), 0);
+        assert_eq!(verified_health(false, Some(1)), 0);
+        assert_eq!(verified_health(false, None), 0);
+    }
+
+    /// The exact regression this change fixes: a silent UDP target was scored
+    /// 100/100 despite proving nothing at all.
+    #[test]
+    fn silent_udp_is_not_perfectly_healthy() {
+        assert!(reachability_health(true, None) < 100);
+    }
 }

@@ -58,6 +58,7 @@ fn publish_metrics_cow_1000(c: &mut Criterion) {
             node_id,
             latency_ms: 40,
             health_score: 95,
+            verified: true,
         })
         .collect::<Vec<_>>();
     c.bench_function("publish_metrics_cow_1000", |b| {

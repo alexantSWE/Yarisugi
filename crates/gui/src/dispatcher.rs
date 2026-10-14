@@ -22,6 +22,9 @@ pub struct ProbeResult {
     pub node_id: u32,
     pub latency_ms: u16,
     pub health_score: u8,
+    /// False for socket-only reachability, true for a verified egress
+    /// transcript. Drives both the health ceiling and the row rendering.
+    pub verified: bool,
 }
 
 #[derive(Clone)]
@@ -75,6 +78,7 @@ impl UiDispatcher {
                             node_id: result.node_id,
                             latency_ms: result.latency_ms,
                             health_score: result.health_score,
+                            verified: result.verified,
                         },
                     );
                 }

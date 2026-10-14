@@ -760,18 +760,38 @@ enum PumpStream {
 
 impl Read for PumpStream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            PumpStream::Tcp(stream) => stream.read(buffer),
-            PumpStream::Tls(stream) => stream.read(buffer),
+        loop {
+            let result = match self {
+                PumpStream::Tcp(stream) => stream.read(buffer),
+                PumpStream::Tls(stream) => stream.read(buffer),
+            };
+            // EINTR is a signal, not a transport failure: the read never
+            // started, so retrying it is always safe.
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::Interrupted)
+            {
+                continue;
+            }
+            return result;
         }
     }
 }
 
 impl Write for PumpStream {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        match self {
-            PumpStream::Tcp(stream) => stream.write(buffer),
-            PumpStream::Tls(stream) => stream.write(buffer),
+        loop {
+            let result = match self {
+                PumpStream::Tcp(stream) => stream.write(buffer),
+                PumpStream::Tls(stream) => stream.write(buffer),
+            };
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::Interrupted)
+            {
+                continue;
+            }
+            return result;
         }
     }
 
@@ -849,11 +869,18 @@ fn read_http_exchange<R: Read>(
         match stream.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => response.extend_from_slice(&buffer[..n]),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::TimedOut =>
             {
                 thread::sleep(Duration::from_millis(5));
+            }
+            // EINTR means a signal landed before the read began: no bytes were
+            // consumed and nothing is wrong with the peer. Retrying here matters
+            // for correctness, not just tidiness -- reporting it as a failed
+            // operator would turn a transient signal into a false accusation
+            // that a node is dead or hijacked.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                let _ = error;
             }
             Err(error) => bail!("egress read failed: {error}"),
         }
@@ -1452,6 +1479,26 @@ mod tests {
         addr
     }
 
+    /// Reads one request's header block, retrying on EINTR. Treating EINTR as
+    /// EOF here would make the stub hang up early under parallel test load,
+    /// which reads as a phantom verification failure.
+    fn read_request_head(stream: &mut impl Read, request: &mut [u8; 8192]) -> usize {
+        let mut used = 0;
+        loop {
+            match stream.read(&mut request[used..]) {
+                Ok(0) => return used,
+                Ok(n) => {
+                    used += n;
+                    if request[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                        return used;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return used,
+            }
+        }
+    }
+
     fn spawn_stub_http(status_line: &'static str, _expect_body: Vec<u8>) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1460,17 +1507,7 @@ mod tests {
                 let Ok(mut stream) = stream else { break };
                 thread::spawn(move || {
                     let mut request = [0u8; 8192];
-                    let mut used = 0;
-                    loop {
-                        let n = stream.read(&mut request[used..]).unwrap_or(0);
-                        if n == 0 {
-                            break;
-                        }
-                        used += n;
-                        if request[..used].windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
+                    read_request_head(&mut stream, &mut request);
                     let _ = stream.write_all(status_line.as_bytes());
                 });
             }
@@ -1550,17 +1587,7 @@ mod tests {
                 let Ok(mut stream) = stream else { break };
                 thread::spawn(move || {
                     let mut request = [0u8; 8192];
-                    let mut used = 0;
-                    loop {
-                        let n = stream.read(&mut request[used..]).unwrap_or(0);
-                        if n == 0 {
-                            break;
-                        }
-                        used += n;
-                        if request[..used].windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
+                    read_request_head(&mut stream, &mut request);
                     let _ = stream.write_all(
                         b"HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
                     );

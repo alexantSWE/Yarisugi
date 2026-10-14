@@ -228,6 +228,12 @@ pub struct MetricsArena {
     pub packet_loss: Vec<u8>,
     pub last_tested: Vec<u64>,
     pub is_operational: Vec<bool>,
+    /// Provenance for `latencies_ms`: `true` when the reading came from a
+    /// verified end-to-end egress transcript, `false` when it is only a
+    /// transport-level (socket) measurement or carried over from the cold
+    /// store. The UI renders the two differently so a cheap TCP connect is
+    /// never presented as a verified ping.
+    pub verified: Vec<bool>,
 }
 
 impl MetricsArena {
@@ -240,15 +246,29 @@ impl MetricsArena {
             packet_loss: vec![0; capacity],
             last_tested: vec![0; capacity],
             is_operational: vec![false; capacity],
+            // Anything restored from the cold store has no transcript attached
+            // to it, so it is reported as unverified until re-measured.
+            verified: vec![false; capacity],
         }
     }
 
-    pub fn apply_update(&mut self, index: usize, latency_ms: u16, health_score: u8) {
+    pub fn apply_update(
+        &mut self,
+        index: usize,
+        latency_ms: u16,
+        health_score: u8,
+        verified: bool,
+    ) {
         if index >= self.len() {
             return;
         }
         self.latencies_ms[index] = latency_ms;
         self.health_scores[index] = health_score.min(100);
+        self.verified[index] = verified;
+    }
+
+    pub fn is_verified(&self, index: usize) -> bool {
+        self.verified.get(index).copied().unwrap_or(false)
     }
 
     pub fn len(&self) -> usize {

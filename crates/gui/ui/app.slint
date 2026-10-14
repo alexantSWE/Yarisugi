@@ -8,6 +8,8 @@ export struct NodeRowData {
     latency_text: string,
     latency_color: color,
     is_active: bool,
+    badge_text: string,
+    badge_color: color,
 }
 
 export component MainWindow inherits Window {
@@ -115,10 +117,28 @@ export component MainWindow inherits Window {
             }
         }
 
-        Text {
-            text: "\{root.total_nodes_count} nodes · virtualized viewport · 30 Hz metric batches";
-            color: #a1a1aa;
-            font-size: 11px;
+        HorizontalLayout {
+            height: 16px;
+            spacing: 16px;
+            Text {
+                text: "\{root.total_nodes_count} nodes · virtualized viewport · 30 Hz metric batches";
+                color: #a1a1aa;
+                font-size: 11px;
+                vertical-alignment: center;
+            }
+            Rectangle { width: 1px; background: #27272a; }
+            Text {
+                text: "✓ egress-verified (status + body matched a quorum of operators)";
+                color: #46a758;
+                font-size: 11px;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "≈ socket reachability only — not proof the tunnel carries traffic";
+                color: #7d8494;
+                font-size: 11px;
+                vertical-alignment: center;
+            }
         }
 
         Rectangle {
@@ -138,6 +158,7 @@ export component MainWindow inherits Window {
                         spacing: 12px;
                         Text { text: node.country; width: 32px; color: #a1a1aa; font-size: 10px; vertical-alignment: center; }
                         Text { text: node.name; color: node.is_active ? #ffffff : #d4d4d8; horizontal-stretch: 1; overflow: elide; vertical-alignment: center; }
+                        Text { text: node.badge_text; width: 14px; font-size: 11px; color: node.badge_color; horizontal-alignment: center; vertical-alignment: center; }
                         Text { text: node.protocol; width: 64px; color: #71717a; font-size: 11px; vertical-alignment: center; }
                         Text { text: node.latency_text; width: 70px; color: node.latency_color; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
                     }

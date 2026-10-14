@@ -175,6 +175,7 @@ mod tests {
             node_id: 7,
             latency_ms: 42,
             health_score: 95,
+            verified: true,
         }]);
         assert_eq!(previous.latencies_ms, vec![UNTESTED_LATENCY]);
         assert_eq!(next.latencies_ms, vec![42]);
@@ -210,11 +211,18 @@ mod tests {
                 node_id: 8,
                 latency_ms: 33,
                 health_score: 88,
+                verified: false,
             },
-            MetricUpdate { node_id: 99, latency_ms: 1, health_score: 1 },
+            MetricUpdate { node_id: 99, latency_ms: 1, health_score: 1, verified: true },
         ]);
         assert_eq!(metrics.latencies_ms, vec![UNTESTED_LATENCY, 33]);
         assert_eq!(metrics.health_scores, vec![0, 88]);
+        assert_eq!(
+            metrics.verified,
+            vec![false, false],
+            "socket-only update must not be flagged verified"
+        );
+        assert!(!metrics.is_verified(1));
         let store = snapshot.load_full();
         assert_eq!(store.latencies_ms, vec![UNTESTED_LATENCY, 100]);
         assert_eq!(store.health_scores, vec![0, 10]);

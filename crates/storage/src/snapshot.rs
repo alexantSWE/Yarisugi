@@ -10,6 +10,9 @@ pub struct MetricUpdate {
     pub node_id: u32,
     pub latency_ms: u16,
     pub health_score: u8,
+    /// True when a verified egress transcript produced this reading; false for
+    /// socket-only reachability measurements.
+    pub verified: bool,
 }
 
 /// Two independently published layers: a cold node store and a hot metric
@@ -57,7 +60,12 @@ impl StoreSnapshot {
         let store = self.store.load();
         for update in updates {
             if let Some(index) = store.index_of(update.node_id) {
-                replacement.apply_update(index, update.latency_ms, update.health_score);
+                replacement.apply_update(
+                    index,
+                    update.latency_ms,
+                    update.health_score,
+                    update.verified,
+                );
             }
         }
         let replacement = Arc::new(replacement);

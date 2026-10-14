@@ -54,9 +54,17 @@ async fn main() -> Result<()> {
     let mut outcomes = probe_batch(&engine, &report.successful_nodes, ProbeDepth::L4Ping).await;
     outcomes.sort_by(|a, b| a.label.cmp(&b.label));
 
-    let alive = outcomes.iter().filter(|outcome| outcome.alive).count();
+    let alive = outcomes.iter().filter(|outcome| outcome.alive()).count();
+    let unknown = outcomes.iter().filter(|outcome| outcome.is_unknown()).count();
+    let dead = outcomes.iter().filter(|outcome| outcome.is_dead()).count();
     for outcome in &outcomes {
-        let status = if outcome.alive { "ALIVE" } else { "DEAD " };
+        let status = if outcome.alive() {
+            "REACH "
+        } else if outcome.is_unknown() {
+            "UNKNWN"
+        } else {
+            "DEAD  "
+        };
         let latency = outcome
             .latency_ms
             .map(|rtt| format!("{}ms", rtt))
@@ -64,7 +72,7 @@ async fn main() -> Result<()> {
         let reason = outcome
             .failure
             .map(describe_failure)
-            .unwrap_or_else(|| "ok");
+            .unwrap_or_else(|| "socket answered");
         let country = String::from_utf8_lossy(&outcome.country_code);
         println!(
             "[{status}] {:>8}  {:9}@{}  {}  {}",
@@ -74,11 +82,12 @@ async fn main() -> Result<()> {
 
     let skipped = report.failed_entries.len();
     println!(
-        "\n{} of {} nodes alive ({} skipped, {} duplicates)",
-        alive,
+        "\n{alive} reachable, {unknown} unconfirmed, {dead} dead (of {} scanned; {skipped} skipped, {} duplicates)",
         report.successful_nodes.len(),
-        skipped,
         report.duplicates_omitted
+    );
+    println!(
+        "REACH = transport answered only. It is not proof the tunnel carries traffic;\nrun the egress quorum (myproxy-gui 'Rescore egress') for a verified verdict."
     );
     Ok(())
 }
