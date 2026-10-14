@@ -347,6 +347,9 @@ fn watchdog_summary(status: &myproxy_controller::FailoverStatus) -> String {
         FailoverAction::Switched { label } => {
             format!("Egress watchdog: auto-switched to {label}")
         }
+        FailoverAction::Adopted { label } => {
+            format!("Egress watchdog: auto-selected {label} (verified)")
+        }
         FailoverAction::Unconfirmed => format!(
             "Egress watchdog: candidate failed confirmation, staying on {active}"
         ),

@@ -1,6 +1,11 @@
+pub mod auto_select;
 pub mod netd_client;
 pub mod proxy_controller;
 
+pub use auto_select::{
+    decide_with_margin, rank_working_nodes, should_switch, tunnel_health, AutoDecision,
+    AutoSelectConfig, AutoSelector, NodeTrack, RankedNode, TunnelHealth,
+};
 pub use myproxy_adapter::egress::ScatterConfig;
 pub use netd_client::{NetdClient, RoutingSpec};
 pub use proxy_controller::{

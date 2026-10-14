@@ -58,7 +58,8 @@ Modern cores like `sing-box` offer production-grade transparent routing (TPROXY)
 | **Network Backend** | Active | Dual-stack `nftables` TPROXY, `SO_MARK` loop prevention, policy routing, and DNS interception. |
 | **Core Adapter & Supervisor** | Active | `sing-box` outbound configuration compilation, atomic config validation, and SIGHUP process management. |
 | **Verification Ladder** | Active | L4 socket preflight (all nodes) → per-protocol egress quorum (finalists only). See *We Don't Tell No Lies* below. |
-| **In-kernel Telemetry** | Active | `INET_DIAG_REQ_V2` via Netlink `sock_diag`, plus `pidfd_getfd` for supervised core sockets. |
+| **Auto Mode** | Active | Quorum-gated eligibility, stability-aware ranking (EWMA latency + jitter + quorum margin + decayed failure), and a switch margin that prevents flapping. |
+| **In-kernel Telemetry** | Active | `INET_DIAG_REQ_V2` via Netlink `sock_diag` as independent early warning for the live tunnel, plus `pidfd_getfd` for supervised core sockets. |
 | **Protocol handshake tier** | Planned | Per-protocol handshake probing; blocked on uTLS fingerprint replay, which stock `rustls` cannot reproduce. |
 
 ---
@@ -122,6 +123,73 @@ UI never paints it as healthy.
 * **Every latency carries its provenance** (`MetricsArena::verified`) from the
   prober through the COW snapshot layer to the viewport, so the distinction
   survives a full catalog refresh instead of living only in a local variable.
+
+---
+
+## Auto Mode: Finding Nodes That Actually Work
+
+Clash/Mihomo and Hiddify ship an "auto" group that picks a node for you. Yarisugi
+has the same idea, built on the verification ladder rather than on a latency
+ping — because an auto mode that picks the wrong node is worse than no auto mode
+at all.
+
+### The eligibility gate
+
+Selection is a **hard filter, not a score**: a node that did not pass the egress
+quorum is removed from the candidate set *before* any ranking happens. There is
+no weighting, no bonus, and no lucky-measurement exception that can promote an
+unverified node. If nothing passes, auto mode **degrades to direct** rather than
+falling back to "the fastest socket" — inventing a winner is exactly the lie
+this project exists to avoid.
+
+### Ranking what survives
+
+Among verified nodes, the cheapest composite cost wins. The fastest node is not
+the best node; the *most reliably* fast node is.
+
+| Term | Why it is in the score |
+| :--- | :--- |
+| **Latency EWMA** | One 40ms sample is noise. An exponential moving average tracks what the node is actually doing. |
+| **Latency spread** (MAD across operators) | `{40ms, 900ms}` has a fine median and terrible real-world behaviour. Jitter breaks connections far more often than latency does. |
+| **Quorum disagreement** | A node that scraped by 2-of-9 is less trustworthy than one 9-of-9 agreed on, even at identical latency. |
+| **Decayed failure penalty** | A node that failed twenty minutes ago is not equally trusted as one that failed last week. The penalty fades on a half-life; one good sample eases it but never erases it. |
+
+### Why it does not flap
+
+Pure-median selection oscillates: A=60ms, B=55ms, swap, next cycle swap back.
+Auto mode switches **only when a challenger beats the incumbent by an explicit
+margin**. That single rule (`AutoSelectConfig::switch_margin`) kills most
+flapping, and it is the most consequential knob in the system — too small and
+the tunnel thrashes, too large and it clings to a bad node.
+
+### In-kernel telemetry as corroboration
+
+Auto mode also reads live `TCP_INFO` for the active tunnel over Netlink
+`sock_diag`, which sees the sing-box child's sockets without borrowing its file
+descriptors. It is deliberately restricted to **early warning**:
+
+- A quorum failure *plus* a sick live socket are two independent signals
+  agreeing, so the cycle may skip waiting out its second confirmation cycle.
+- Telemetry **never** marks a node healthy. Only the quorum can do that.
+- Telemetry **never** triggers a switch by itself. `escalate` still demands an
+  independent confirmation probe.
+- `None` means *no evidence* — a node with no visible socket is never treated
+  as sick. Absence of telemetry is not evidence of trouble.
+
+This is the Linux-native part: the decision is informed by kernel state
+(retransmits, unacked backlog, RTT variance) rather than by synthetic test
+traffic, which is precisely what makes the tunnel self-reporting instead of
+probed.
+
+### Existing safety machinery auto mode inherits
+
+Selection did not start from scratch — it sits on the paranoid failover loop,
+which already guarantees: a tiered cheap-then-heavy sweep (a 50k-node
+subscription never means 50k sing-box testbeds), an **independent second
+confirmation probe before every automatic switch**, an explicit `Unconfirmed`
+state that *stays put* rather than acting on weak evidence, anti-flap cooldown
+and manual-switch courtesy windows, degrade-to-direct when nothing works, and
+automatic healing when a node comes back.
 
 ---
 

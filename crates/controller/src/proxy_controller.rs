@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+use crate::auto_select::{rank_working_nodes, tunnel_health, AutoSelector, TunnelHealth};
 use crate::netd_client::{NetdClient, RoutingSpec};
 
 /// Single mark used for the whole tproxy pipeline (matching the netd ruleset);
@@ -448,6 +449,10 @@ pub struct CandidateScore {
     /// Median latency across operators that verified (avoids one slow/fast
     /// operator dominating; None when nothing verified).
     pub median_latency: Option<Duration>,
+    /// Median absolute deviation of the verified latencies. A node whose
+    /// operators disagree wildly is *unstable*, which hurts real traffic more
+    /// than a uniformly slower node does. `None` when nothing verified.
+    pub latency_spread: Option<Duration>,
 }
 
 /// Pure scoring over already-collected trial reports: quorum-passing candidates
@@ -471,23 +476,38 @@ pub fn rank_candidates(
                 verified: report.map_or(0, |r| r.verified),
                 total: report.map_or(0, |r| r.total),
                 passes: report.map_or(false, |r| r.quorum_verified >= min_verified),
-                median_latency: report.and_then(median_of_verified),
+                median_latency: report.and_then(|r| median_of_verified(r).0),
+                latency_spread: report.and_then(|r| median_of_verified(r).1),
             }
         })
         .collect()
 }
 
-/// Median round-trip across the operators that verified (avoids one slow/fast
-/// operator dominating); `None` when nothing verified.
-fn median_of_verified(report: &ScatterReport) -> Option<Duration> {
-    let mut latencies = report
+/// Median round-trip across the operators that verified, plus the median
+/// absolute deviation around it. Both are `None` when nothing verified.
+///
+/// The spread is the honest signal that a bare median hides: a node measuring
+/// `{40ms, 900ms}` has a fine median and terrible real-world behaviour.
+fn median_of_verified(report: &ScatterReport) -> (Option<Duration>, Option<Duration>) {
+    let mut latencies: Vec<u128> = report
         .checks
         .iter()
         .filter(|check| check.verified)
-        .map(|check| check.latency)
-        .collect::<Vec<_>>();
-    latencies.sort();
-    latencies.get(latencies.len() / 2).copied()
+        .map(|check| check.latency.as_millis())
+        .collect();
+    latencies.sort_unstable();
+    let Some(&median) = latencies.get(latencies.len() / 2) else {
+        return (None, None);
+    };
+    let median_ms = u64::try_from(median).unwrap_or(u64::MAX);
+    let mut deviations: Vec<u128> = latencies
+        .iter()
+        .map(|value| value.abs_diff(median))
+        .collect();
+    deviations.sort_unstable();
+    let spread_ms =
+        u64::try_from(deviations.get(deviations.len() / 2).copied().unwrap_or(0)).unwrap_or(u64::MAX);
+    (Some(Duration::from_millis(median_ms)), Some(Duration::from_millis(spread_ms)))
 }
 
 /// See `rank_candidates`: sorts a scored list into selection order.
@@ -643,7 +663,8 @@ pub fn tiered_shortlist(
                 verified: report.map_or(0, |r| r.verified),
                 total: report.map_or(0, |r| r.total),
                 passes: report.map_or(false, |r| r.quorum_verified >= heavy.min_verified),
-                median_latency: report.and_then(median_of_verified),
+                median_latency: report.and_then(|r| median_of_verified(r).0),
+                latency_spread: report.and_then(|r| median_of_verified(r).1),
             }
         })
         .collect::<Vec<_>>();
@@ -683,6 +704,14 @@ pub struct FailoverConfig {
     /// Extra shortlist refresh during this UTC hour window, whatever the
     /// healthy cadence says (the "works at 1 AM" node phenomenon). Off = `None`.
     pub quiet_hours_utc: Option<(u8, u8)>,
+    /// `TCP_INFO` grade below which the live tunnel counts as independently
+    /// suspicious. `None` disables the early-warning path entirely.
+    pub tunnel_health_floor: Option<u8>,
+    /// When there is no active node, verify the catalog and adopt the best
+    /// working node instead of sitting idle. This is what makes auto mode
+    /// actually automatic: without it the watchdog only ever reacts to a node
+    /// the user picked by hand.
+    pub auto_select_on_idle: bool,
 }
 
 impl Default for FailoverConfig {
@@ -695,6 +724,8 @@ impl Default for FailoverConfig {
             rescore_limit: 8,
             background_rescore_cycles: 4,
             quiet_hours_utc: None,
+            tunnel_health_floor: Some(35),
+            auto_select_on_idle: true,
         }
     }
 }
@@ -712,6 +743,9 @@ pub enum FailoverAction {
     /// A different candidate passed a full scatter *and* an independent
     /// confirmation probe, and has been switched to automatically.
     Switched { label: String },
+    /// No node was active, so auto mode verified the catalog and adopted the
+    /// best working node on its own.
+    Adopted { label: String },
     /// Candidates existed and passed trials but failed the confirmation probe;
     /// we stay put rather than act on unconfirmed evidence.
     Unconfirmed,
@@ -734,7 +768,15 @@ pub enum FailoverAction {
 
 impl FailoverAction {
     pub fn is_intervention(&self) -> bool {
-        matches!(self, FailoverAction::Switched { .. } | FailoverAction::Degraded | FailoverAction::Healed { .. })
+        // An adoption changes the active node exactly as a switch does, so it
+        // must count as an intervention for cooldown and status purposes.
+        matches!(
+            self,
+            FailoverAction::Switched { .. }
+                | FailoverAction::Adopted { .. }
+                | FailoverAction::Degraded
+                | FailoverAction::Healed { .. }
+        )
     }
 }
 
@@ -749,6 +791,11 @@ pub struct FailoverStatus {
     pub shortlist: Vec<CandidateScore>,
     /// Healthy cycles since the last shortlist refresh (resets on refresh).
     pub cycles_since_rescore: u32,
+    /// Per-node selection history. Carried here because this is the only
+    /// mutable state a cycle is allowed to keep between runs -- the EWMA and
+    /// failure decay are what stop auto mode from chasing a single lucky
+    /// measurement.
+    pub selector: AutoSelector,
 }
 
 /// The operations a watchdog cycle may run. Injected for tests; `FailoverHooks::real`
@@ -765,17 +812,25 @@ type RescoreHook = Box<
 type SwitchHook =
     Box<dyn Fn(&ProxyController, &CanonicalNode, bool) -> Result<String> + Send + Sync>;
 type DegradeHook = Box<dyn Fn(&ProxyController) + Send + Sync>;
+/// Live in-kernel telemetry for the tunnel to a node. `None` means "no
+/// evidence" (no established socket the kernel can see), never "dead".
+type TunnelHealthHook =
+    Box<dyn Fn(&ProxyController, &CanonicalNode) -> Option<TunnelHealth> + Send + Sync>;
 
 pub struct FailoverHooks {
     pub probe: ProbeHook,
     pub rescore: RescoreHook,
     pub switch_node: SwitchHook,
     pub degrade: DegradeHook,
+    /// Optional. When absent, or when it returns `None`, the cycle simply loses
+    /// the early-warning signal and falls back to quorum-only timing.
+    pub tunnel_health: Option<TunnelHealthHook>,
 }
 
 impl FailoverHooks {
     /// The production wiring: real cheap preflight + egress scatter, real
-    /// shortlisting, real atomic switch, real degrade-to-direct.
+    /// shortlisting, real atomic switch, real degrade-to-direct, and real
+    /// Netlink `sock_diag` telemetry for the live tunnel.
     pub fn real() -> Self {
         Self {
             probe: Box::new(verify_node_egress),
@@ -792,6 +847,12 @@ impl FailoverHooks {
                 controller.switch_node(node, automatic)
             }),
             degrade: Box::new(ProxyController::degrade_to_direct),
+            tunnel_health: Some(Box::new(|_controller, node| {
+                tunnel_health(
+                    node,
+                    &myproxy_probe::socket_health::HealthThresholds::default(),
+                )
+            })),
         }
     }
 }
@@ -817,8 +878,16 @@ pub fn run_failover_cycle(
     }
 
     let Some(active) = active else {
-        status.shortlist = Vec::new();
-        return FailoverAction::Idle;
+        // Auto mode's entry point: with nothing active, verify the catalog and
+        // adopt the best working node rather than waiting for the user.
+        return match config.auto_select_on_idle {
+            true => auto_adopt(controller, config, hooks, &cfg, status)
+                .unwrap_or(FailoverAction::Idle),
+            false => {
+                status.shortlist = Vec::new();
+                FailoverAction::Idle
+            }
+        };
     };
 
     if let Some(manual) = controller.last_manual_switch() {
@@ -843,7 +912,22 @@ Ok(report) if report.passes => {
         Ok(_) | Err(_) => {
             let failures = status.consecutive_failures + 1;
             status.consecutive_failures = failures;
-            if failures < config.required_consecutive_failures {
+
+            // Independent corroboration from the kernel. A quorum failure plus a
+            // sick live socket is two separate signals agreeing, so we may skip
+            // waiting out the second cycle.
+            //
+            // This deliberately does NOT let telemetry assert that a node is
+            // *healthy*, and never triggers a switch on its own: the quorum is
+            // still the only thing that declares failure, and `escalate` still
+            // demands an independent confirmation probe before changing nodes.
+            let corroborated = tunnel_confirms_trouble(controller, config, hooks, &active);
+            let required = if corroborated {
+                1
+            } else {
+                config.required_consecutive_failures
+            };
+            if failures < required {
                 // Pre-arm the shortlist while confidence builds, so the moment
                 // we are sure the swap is instant.
                 let _ = rescore(controller, hooks, config, &cfg, status);
@@ -857,6 +941,27 @@ Ok(report) if report.passes => {
             escalate(controller, config, hooks, &cfg, status, &active)
         }
     }
+}
+
+/// True when the kernel independently reports the live tunnel as sick.
+///
+/// Returns `false` whenever there is no evidence at all (`None`), so a node
+/// with no visible socket is never treated as suspicious -- absence of
+/// telemetry is not evidence of trouble.
+fn tunnel_confirms_trouble(
+    controller: &ProxyController,
+    config: &FailoverConfig,
+    hooks: &FailoverHooks,
+    active: &CanonicalNode,
+) -> bool {
+    let Some(floor) = config.tunnel_health_floor else {
+        return false;
+    };
+    let Some(hook) = hooks.tunnel_health.as_ref() else {
+        return false;
+    };
+    hook(controller, active)
+        .is_some_and(|health| health.grade < floor)
 }
 
 fn rescore(
@@ -884,19 +989,35 @@ fn escalate(
     status: &mut FailoverStatus,
     active: &CanonicalNode,
 ) -> FailoverAction {
-    let candidates = match candidate_nodes(controller) {
-        Ok(candidates) => candidates,
+    let candidates = match candidate_pairs(controller) {
+        Ok((ids, nodes)) => (ids, nodes),
         Err(error) => return FailoverAction::Error(format!("catalog unavailable: {error:#}")),
     };
-    let mut shortlist = match (hooks.rescore)(controller, &candidates, cfg, config.rescore_limit) {
+    let (ids, nodes) = candidates;
+    let mut shortlist = match (hooks.rescore)(controller, &nodes, cfg, config.rescore_limit) {
         Ok(shortlist) => shortlist,
         Err(error) => return FailoverAction::Error(format!("rescore failed: {error:#}")),
     };
     shortlist.retain(|score| score.label != active.meta.label.as_ref());
-    status.shortlist = shortlist.clone();
 
-    for score in shortlist.iter().filter(|score| score.passes) {
-        let candidate = &candidates[score.node_index];
+    // Rank by the composite selection cost (stability, quorum margin, failure
+    // history) rather than taking the first candidate that passes -- "the
+    // fastest one that happened to answer" is exactly the selection bias that
+    // produces flapping tunnels.
+    let now = Instant::now();
+    status.selector.observe_round(&ids, &shortlist, now);
+    status.shortlist = shortlist.clone();
+    let ranked = rank_working_nodes(
+        &shortlist,
+        status.selector.tracks(),
+        &ids,
+        status.selector.config(),
+        now,
+    );
+
+    let mut saw_a_passer = false;
+    for entry in &ranked {
+        let candidate = &nodes[entry.node_index];
         // Independent confirmation: the upgrade must pass the whole scatter a
         // second time before we trust it. Paranoid by design.
         match (hooks.probe)(controller, candidate, cfg) {
@@ -909,11 +1030,14 @@ fn escalate(
                     Err(error) => FailoverAction::Error(format!("switch failed: {error:#}")),
                 };
             }
-            _ => continue,
+            _ => {
+                saw_a_passer = true;
+                continue;
+            }
         }
     }
 
-    if shortlist.iter().any(|score| score.passes) {
+    if saw_a_passer {
         return FailoverAction::Unconfirmed;
     }
     // Nothing passed trials anywhere. Confident that this is truly dead.
@@ -956,11 +1080,65 @@ fn heal_or_stay_degraded(
 }
 
 fn candidate_nodes(controller: &ProxyController) -> Result<Vec<CanonicalNode>> {
-    Ok(controller
-        .load_probe_targets()?
-        .into_iter()
-        .map(|(_, node)| node)
-        .collect())
+    Ok(candidate_pairs(controller)?.1)
+}
+
+/// Catalog nodes paired with their persisted ids. The ids are what the
+/// selection tracks are keyed on, so the two must travel together.
+fn candidate_pairs(controller: &ProxyController) -> Result<(Vec<u32>, Vec<CanonicalNode>)> {
+    let targets = controller.load_probe_targets()?;
+    let mut ids = Vec::with_capacity(targets.len());
+    let mut nodes = Vec::with_capacity(targets.len());
+    for (id, node) in targets {
+        ids.push(id);
+        nodes.push(node);
+    }
+    Ok((ids, nodes))
+}
+
+/// Auto mode's entry point: with no active node, verify the catalog and adopt
+/// the best node that actually works.
+///
+/// Returns `None` when there is nothing to select from (empty catalog, or the
+/// rescore failed outright), letting the caller fall back to `Idle`. A catalog
+/// that yields no quorum-passing node is *not* `None` -- that is a real verdict
+/// and the caller degrades rather than inventing a winner.
+fn auto_adopt(
+    controller: &ProxyController,
+    config: &FailoverConfig,
+    hooks: &FailoverHooks,
+    cfg: &ScatterConfig,
+    status: &mut FailoverStatus,
+) -> Option<FailoverAction> {
+    let (ids, nodes) = candidate_pairs(controller).ok()?;
+    if nodes.is_empty() {
+        return None;
+    }
+    let scores = (hooks.rescore)(controller, &nodes, cfg, config.rescore_limit).ok()?;
+    let now = Instant::now();
+    status.selector.observe_round(&ids, &scores, now);
+    status.shortlist = scores.clone();
+
+    let ranked = rank_working_nodes(
+        &scores,
+        status.selector.tracks(),
+        &ids,
+        status.selector.config(),
+        now,
+    );
+    let Some(best) = ranked.first() else {
+        // Nothing in the catalog is demonstrably working. Auto mode does not
+        // fall back to "fastest socket" -- it degrades.
+        return Some(FailoverAction::Degraded);
+    };
+    let node = &nodes[best.node_index];
+    match (hooks.switch_node)(controller, node, true) {
+        Ok(label) => {
+            status.consecutive_failures = 0;
+            Some(FailoverAction::Adopted { label })
+        }
+        Err(error) => Some(FailoverAction::Error(format!("auto-select switch failed: {error:#}"))),
+    }
 }
 
 fn should_refresh_shortlist(config: &FailoverConfig, status: &mut FailoverStatus) -> bool {
@@ -1351,6 +1529,7 @@ mod tests {
                             total: 8,
                             passes: passing,
                             median_latency: Some(Duration::from_millis(40)),
+                            latency_spread: Some(Duration::from_millis(4)),
                         }
                     })
                     .collect())
@@ -1366,7 +1545,31 @@ mod tests {
             degrade: Box::new(move |_controller| {
                 degrade_egress.lock().unwrap().degrade_calls += 1;
             }),
+            // No kernel telemetry in the default mock: cycles fall back to
+            // quorum-only timing.
+            tunnel_health: None,
         }
+    }
+
+    /// `fake_hooks` plus a tunnel-health signal returning a fixed grade for the
+    /// active node.
+    fn fake_hooks_with_tunnel(
+        egress: Arc<Mutex<MockEgress>>,
+        grade: Option<u8>,
+    ) -> FailoverHooks {
+        let mut hooks = fake_hooks(egress);
+        hooks.tunnel_health = Some(Box::new(move |_controller, node| {
+            grade.map(|grade| TunnelHealth {
+                grade,
+                rtt_ms: 40,
+                spread_ms: 2,
+                retransmits: 0,
+                connections: 1,
+                // keep the node in scope for clarity
+            })
+            .filter(|_| !node.meta.label.is_empty())
+        }));
+        hooks
     }
 
     fn force_active(controller: &ProxyController, node: CanonicalNode) {
@@ -1382,6 +1585,8 @@ mod tests {
             rescore_limit: 8,
             background_rescore_cycles: 0,
             quiet_hours_utc: None,
+            tunnel_health_floor: Some(35),
+            auto_select_on_idle: false,
         }
     }
 
@@ -1408,6 +1613,210 @@ mod tests {
         let guard = egress.lock().unwrap();
         assert_eq!(guard.switches.last(), Some(&("Beta".into(), true)));
         assert_eq!(guard.probes, vec!["Alpha", "Alpha", "Beta"]);
+    }
+
+    #[test]
+    fn sick_live_socket_escalates_without_waiting_a_second_cycle() {
+        // Quorum failure *and* independently sick kernel telemetry: two
+        // agreeing signals, so the cycle escalates immediately.
+        let controller = failover_controller();
+        force_active(&controller, vless_node());
+        let egress = Arc::new(Mutex::new(MockEgress::new(HashMap::from([
+            ("Alpha".into(), Muck::Fail),
+            ("Beta".into(), Muck::Pass),
+        ]))));
+        egress.lock().unwrap().rescore_passing = vec!["Beta".into()];
+        let hooks = fake_hooks_with_tunnel(Arc::clone(&egress), Some(10));
+
+        let mut status = FailoverStatus::default();
+        let action = run_failover_cycle(&controller, &base_config(), &hooks, &mut status);
+        assert_eq!(
+            action,
+            FailoverAction::Switched { label: "Beta".into() },
+            "kernel corroboration should skip the second cycle"
+        );
+        // And the switch still required the independent confirmation probe.
+        let guard = egress.lock().unwrap();
+        assert_eq!(guard.probes, vec!["Alpha", "Beta"]);
+    }
+
+    #[test]
+    fn healthy_live_socket_never_skips_the_confirmation_cycle() {
+        // The early-warning path must not become a shortcut around the
+        // two-cycle confirmation, and it must never fire a switch by itself.
+        let controller = failover_controller();
+        force_active(&controller, vless_node());
+        let egress = Arc::new(Mutex::new(MockEgress::new(HashMap::from([
+            ("Alpha".into(), Muck::Fail),
+            ("Beta".into(), Muck::Pass),
+        ]))));
+        egress.lock().unwrap().rescore_passing = vec!["Beta".into()];
+        let hooks = fake_hooks_with_tunnel(Arc::clone(&egress), Some(98));
+
+        let mut status = FailoverStatus::default();
+        let first = run_failover_cycle(&controller, &base_config(), &hooks, &mut status);
+        assert_eq!(first, FailoverAction::Inspecting { failures: 1 });
+        let second = run_failover_cycle(&controller, &base_config(), &hooks, &mut status);
+        assert_eq!(second, FailoverAction::Switched { label: "Beta".into() });
+    }
+
+    #[test]
+    fn absent_telemetry_is_never_treated_as_trouble() {
+        // No visible socket means "no evidence", not "sick". Absence must leave
+        // the normal two-cycle timing untouched rather than forcing escalation.
+        let controller = failover_controller();
+        force_active(&controller, vless_node());
+        let egress = Arc::new(Mutex::new(MockEgress::new(HashMap::from([
+            ("Alpha".into(), Muck::Fail),
+            ("Beta".into(), Muck::Pass),
+        ]))));
+        egress.lock().unwrap().rescore_passing = vec!["Beta".into()];
+        let hooks = fake_hooks_with_tunnel(Arc::clone(&egress), None);
+
+        let mut status = FailoverStatus::default();
+        let first = run_failover_cycle(&controller, &base_config(), &hooks, &mut status);
+        assert_eq!(
+            first,
+            FailoverAction::Inspecting { failures: 1 },
+            "no evidence must not be escalated as if it were proof of failure"
+        );
+    }
+
+    #[test]
+    fn tunnel_telemetry_alone_can_never_mark_a_node_healthy() {
+        // Even with a perfect grade, a node that fails quorum is not Healthy:
+        // telemetry corroborates, it never rules.
+        let controller = failover_controller();
+        force_active(&controller, vless_node());
+        let egress = Arc::new(Mutex::new(MockEgress::new(HashMap::from([(
+            "Alpha".into(),
+            Muck::Fail,
+        )]))));
+        let hooks = fake_hooks_with_tunnel(Arc::clone(&egress), Some(100));
+
+        let mut status = FailoverStatus::default();
+        let action = run_failover_cycle(&controller, &base_config(), &hooks, &mut status);
+        assert_ne!(action, FailoverAction::Healthy);
+    }
+
+    #[test]
+    fn disabled_floor_ignores_tunnel_telemetry_entirely() {
+        let controller = failover_controller();
+        force_active(&controller, vless_node());
+        let egress = Arc::new(Mutex::new(MockEgress::new(HashMap::from([
+            ("Alpha".into(), Muck::Fail),
+            ("Beta".into(), Muck::Pass),
+        ]))));
+        egress.lock().unwrap().rescore_passing = vec!["Beta".into()];
+        let hooks = fake_hooks_with_tunnel(Arc::clone(&egress), Some(1));
+        let mut config = base_config();
+        config.tunnel_health_floor = None;
+
+        let mut status = FailoverStatus::default();
+        let first = run_failover_cycle(&controller, &config, &hooks, &mut status);
+        assert_eq!(
+            first,
+            FailoverAction::Inspecting { failures: 1 },
+            "an explicit None floor must disable the early-warning path"
+        );
+    }
+
+    #[test]
+    fn auto_select_adopts_the_best_working_node_when_idle() {
+        // The entry point: with nothing active, auto mode verifies the catalog
+        // and picks a node by itself rather than sitting idle forever.
+        let controller = failover_controller();
+        // No active node.
+        let egress = Arc::new(Mutex::new(MockEgress::new(HashMap::from([
+            ("Alpha".into(), Muck::Fail),
+            ("Beta".into(), Muck::Pass),
+        ]))));
+        egress.lock().unwrap().rescore_passing = vec!["Beta".into()];
+        let hooks = fake_hooks(Arc::clone(&egress));
+        let mut config = base_config();
+        config.auto_select_on_idle = true;
+
+        let mut status = FailoverStatus::default();
+        let action = run_failover_cycle(&controller, &config, &hooks, &mut status);
+        assert_eq!(
+            action,
+            FailoverAction::Adopted { label: "Beta".into() },
+            "auto mode must adopt the best verified node on its own"
+        );
+        let guard = egress.lock().unwrap();
+        assert_eq!(guard.switches.last(), Some(&("Beta".into(), true)));
+    }
+
+    #[test]
+    fn adoption_counts_as_an_intervention() {
+        // It changes the active node, exactly as a switch does.
+        assert!(FailoverAction::Adopted { label: "Beta".into() }.is_intervention());
+        assert!(!FailoverAction::Inspecting { failures: 1 }.is_intervention());
+        assert!(!FailoverAction::Healthy.is_intervention());
+    }
+
+    #[test]
+    fn auto_select_refuses_to_invent_a_winner() {
+        // Nothing passes quorum -> degrade. Auto mode must never fall back to
+        // "the fastest socket", which is the whole lie this project exists to
+        // avoid.
+        let controller = failover_controller();
+        let egress = Arc::new(Mutex::new(MockEgress::new(HashMap::from([
+            ("Alpha".into(), Muck::Fail),
+            ("Beta".into(), Muck::Fail),
+        ]))));
+        egress.lock().unwrap().rescore_passing = vec![];
+        let hooks = fake_hooks(Arc::clone(&egress));
+        let mut config = base_config();
+        config.auto_select_on_idle = true;
+
+        let mut status = FailoverStatus::default();
+        let action = run_failover_cycle(&controller, &config, &hooks, &mut status);
+        assert_eq!(
+            action,
+            FailoverAction::Degraded,
+            "no verified node must degrade, never guess"
+        );
+        assert!(
+            egress.lock().unwrap().switches.is_empty(),
+            "auto mode must not switch to an unverified node"
+        );
+    }
+
+    #[test]
+    fn auto_select_off_leaves_the_controller_idle() {
+        let controller = failover_controller();
+        let egress = Arc::new(Mutex::new(MockEgress::new(HashMap::from([
+            ("Alpha".into(), Muck::Fail),
+            ("Beta".into(), Muck::Pass),
+        ]))));
+        egress.lock().unwrap().rescore_passing = vec!["Beta".into()];
+        let hooks = fake_hooks(Arc::clone(&egress));
+
+        let mut status = FailoverStatus::default();
+        let action = run_failover_cycle(&controller, &base_config(), &hooks, &mut status);
+        assert_eq!(action, FailoverAction::Idle);
+        assert!(egress.lock().unwrap().switches.is_empty());
+    }
+
+    #[test]
+    fn auto_select_on_empty_catalog_stays_idle() {
+        let controller =
+            ProxyController::open_memory(
+                Path::new("/nonexistent/sing-box"),
+                &std::env::temp_dir().join("myproxy-controller-empty.json"),
+            )
+            .unwrap();
+        let egress = Arc::new(Mutex::new(MockEgress::new(HashMap::new())));
+        let hooks = fake_hooks(Arc::clone(&egress));
+        let mut config = base_config();
+        config.auto_select_on_idle = true;
+
+        let mut status = FailoverStatus::default();
+        assert_eq!(
+            run_failover_cycle(&controller, &config, &hooks, &mut status),
+            FailoverAction::Idle
+        );
     }
 
     #[test]
